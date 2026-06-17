@@ -99,6 +99,13 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
       });
 
   const int partition_count = config.num_partitions > 0 ? config.num_partitions : 1;
+    const unsigned long long ideal_partition_wgt =
+      (total_coarse_wgt + static_cast<unsigned long long>(partition_count) - 1ull) /
+      static_cast<unsigned long long>(partition_count);
+    const unsigned long long partition_wgt_cap =
+      (config.max_partition_wgt > 0.0f)
+        ? static_cast<unsigned long long>(config.max_partition_wgt)
+        : (ideal_partition_wgt + (ideal_partition_wgt / 20ull) + 1ull);
   Kokkos::parallel_for(
       "init_coarse_partition", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_coarse_vertices)),
       KOKKOS_LAMBDA(const int i) {
@@ -128,6 +135,14 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
   unsigned long long proposed_moves = 0;
   const int refinement_passes = options.refinement_passes > 0 ? options.refinement_passes : 1;
   for (int pass = 0; pass < refinement_passes; ++pass) {
+    Kokkos::deep_copy(state.partition_wgt, 0u);
+    Kokkos::parallel_for(
+        "recompute_partition_weights_pass", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+        KOKKOS_LAMBDA(const int i) {
+          const unsigned partition_id = state.partition(i);
+          Kokkos::atomic_add(&state.partition_wgt(partition_id), level0.vwgt(i));
+        });
+
     Kokkos::parallel_for(
         "compute_refinement_candidates", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
         KOKKOS_LAMBDA(const int i) {
@@ -163,7 +178,17 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
 
           refine.gain(i) = external_weight - internal_weight;
           refine.target_partition(i) = selected_target;
-          refine.move_flag(i) = (selected_target != partition_id && refine.gain(i) > 0) ? 1u : 0u;
+          if ((selected_target != partition_id) && (refine.gain(i) > 0)) {
+            const unsigned vertex_wgt = level0.vwgt(i);
+            const unsigned target_wgt = state.partition_wgt(selected_target);
+            const bool parity_selected = (((static_cast<unsigned>(i) + static_cast<unsigned>(pass)) & 1u) == 0u);
+            const bool within_cap =
+                static_cast<unsigned long long>(target_wgt) + static_cast<unsigned long long>(vertex_wgt) <=
+                partition_wgt_cap;
+            refine.move_flag(i) = (parity_selected && within_cap) ? 1u : 0u;
+          } else {
+            refine.move_flag(i) = 0u;
+          }
         });
 
     unsigned long long pass_moves = 0;

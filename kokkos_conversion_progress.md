@@ -138,6 +138,10 @@ Latest observed pipeline output:
   - CLI now accepts optional `refinement_passes` argument
   - pipeline runs repeated candidate/move rounds with early stop when no moves are proposed
   - reports `refinement_passes` in pipeline diagnostics
+- Added deterministic move-conflict mitigation and balance guardrails:
+  - proposal acceptance is parity-gated per pass for deterministic concurrent move filtering
+  - move proposals are rejected when target partition exceeds a computed/ configured weight cap
+  - partition weights are recomputed each pass before candidate evaluation
 
 ### Validation
 
@@ -151,7 +155,7 @@ python3 kokkos_port/tools/check_levels_invariants.py --levels out_kokkos_stub.le
 
 Observed output:
 
-- `[kokkos_port] phase-1 stub completed for 2897387 vertices, cutsize=1201153, max_partition_wgt=45590, proposed_moves=73207, refinement_passes=2`
+- `[kokkos_port] phase-1 stub completed for 2897387 vertices, cutsize=1197861, max_partition_wgt=45599, proposed_moves=56758, refinement_passes=3`
 - `PASS: rows=2897387 columns=3`
 
 Result: PASS (one-level coarsen/uncoarsen path is functional)
@@ -204,7 +208,7 @@ Latest observed hardening output:
 
 ## Planned Next Milestone
 
-Phase 4/5 milestone E:
+Phase 4/5 milestone F:
 
-- add deterministic conflict-resolution mode for concurrent move proposals
-- add partition-balance guardrails in move acceptance path
+- add per-pass diagnostics export for accepted moves and partition imbalance
+- add strict-mode compare harness path for pre-refinement snapshots
