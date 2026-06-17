@@ -164,6 +164,11 @@ Result: PASS (one-level coarsen/uncoarsen path is functional)
   - validates pairwise coarse grouping invariants (`max_group_size <= 2`, consecutive pairs)
 - Wired consistency checker into phase compare workflow:
   - `kokkos_port/tools/run_phase1_compare.sh`
+- Added coarsened-weight conservation checker:
+  - `kokkos_port/tools/check_coarsened_weight_conservation.py`
+  - validates `L0 -> L1` pairwise mapping, full L0 coverage, and total fine/coarse weight conservation
+- Wired coarsened-weight conservation checker into phase compare workflow:
+  - `kokkos_port/tools/run_phase1_compare.sh` now requires `<graph_file>` input
 
 ### Validation
 
@@ -179,6 +184,7 @@ Observed output:
 
 - `PASS: rows=2897387 columns=3`
 - `PASS: coarse_vertices=1448694 max_group_size=2 mixed_partition_coarse_vertices=36620`
+- `PASS: fine_vertices=2897387 coarse_vertices=1448694 fine_total_weight=4108790870859 coarse_total_weight=4108790870859`
 
 Result: PASS (hardening checks active and passing)
 
@@ -194,7 +200,7 @@ Latest observed hardening output:
 
 ## Planned Next Milestone
 
-Phase 4/5 milestone C:
+Phase 4/5 milestone D:
 
-- add coarsened weight conservation checker to tooling
-- enforce optional strict coarse-consistency mode in compare script pre-refinement snapshot path
+- add iterative refinement rounds with configurable pass count
+- add deterministic conflict-resolution mode for concurrent move proposals
