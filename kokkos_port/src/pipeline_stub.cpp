@@ -5,13 +5,13 @@
 
 #include <iostream>
 #include <fstream>
-#include <vector>
 
 namespace gkway_kokkos {
 
 template <typename ExecSpace>
 void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config) {
   using view_u = Kokkos::View<unsigned*, typename ExecSpace::memory_space>;
+  using view_ull = Kokkos::View<unsigned long long*, typename ExecSpace::memory_space>;
 
   HostGraph host_graph;
   try {
@@ -53,12 +53,18 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
   state.if_boundary = view_u("if_boundary", num_vertices);
   state.cutsize = view_u("cutsize", 1);
 
+  RefinementState<ExecSpace> refine;
+  refine.gain = Kokkos::View<int*, typename ExecSpace::memory_space>("gain", num_vertices);
+  refine.target_partition = view_u("target_partition", num_vertices);
+  refine.move_flag = view_u("move_flag", num_vertices);
+
   Kokkos::deep_copy(state.partition_wgt, 0u);
   Kokkos::deep_copy(state.if_boundary, 0u);
   Kokkos::deep_copy(state.cutsize, 0u);
 
   const std::size_t num_coarse_vertices = (num_vertices + 1) / 2;
   view_u coarse_vwgt("coarse_vwgt", num_coarse_vertices);
+  view_ull coarse_prefix("coarse_prefix", num_coarse_vertices);
   view_u coarse_partition("coarse_partition", num_coarse_vertices);
   Kokkos::deep_copy(coarse_vwgt, 0u);
 
@@ -70,27 +76,40 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
         Kokkos::atomic_add(&coarse_vwgt(coarse_idx), level0.vwgt(i));
       });
 
-  {
-    const int partition_count = config.num_partitions > 0 ? config.num_partitions : 1;
-    auto h_coarse_vwgt = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), coarse_vwgt);
-    auto h_coarse_partition = Kokkos::create_mirror_view(coarse_partition);
-    std::vector<unsigned long long> bucket_wgt(static_cast<std::size_t>(partition_count), 0ull);
+  unsigned long long total_coarse_wgt = 0;
+  Kokkos::parallel_reduce(
+      "reduce_total_coarse_vwgt", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_coarse_vertices)),
+      KOKKOS_LAMBDA(const int i, unsigned long long& local_sum) {
+        local_sum += static_cast<unsigned long long>(coarse_vwgt(i));
+      },
+      total_coarse_wgt);
 
-    for (std::size_t coarse_idx = 0; coarse_idx < num_coarse_vertices; ++coarse_idx) {
-      int best_partition = 0;
-      for (int candidate = 1; candidate < partition_count; ++candidate) {
-        if (bucket_wgt[static_cast<std::size_t>(candidate)] <
-            bucket_wgt[static_cast<std::size_t>(best_partition)]) {
-          best_partition = candidate;
-        }
-      }
-
-      h_coarse_partition(coarse_idx) = static_cast<unsigned>(best_partition);
-      bucket_wgt[static_cast<std::size_t>(best_partition)] += h_coarse_vwgt(coarse_idx);
-    }
-
-    Kokkos::deep_copy(coarse_partition, h_coarse_partition);
+  if (total_coarse_wgt == 0) {
+    total_coarse_wgt = 1;
   }
+
+  Kokkos::parallel_scan(
+      "scan_coarse_prefix", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_coarse_vertices)),
+      KOKKOS_LAMBDA(const int i, unsigned long long& update, const bool final_pass) {
+        const unsigned long long weight = static_cast<unsigned long long>(coarse_vwgt(i));
+        if (final_pass) {
+          coarse_prefix(i) = update;
+        }
+        update += weight;
+      });
+
+  const int partition_count = config.num_partitions > 0 ? config.num_partitions : 1;
+  Kokkos::parallel_for(
+      "init_coarse_partition", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_coarse_vertices)),
+      KOKKOS_LAMBDA(const int i) {
+        const unsigned long long scaled_prefix =
+            coarse_prefix(i) * static_cast<unsigned long long>(partition_count);
+        unsigned partition_id = static_cast<unsigned>(scaled_prefix / total_coarse_wgt);
+        if (partition_id >= static_cast<unsigned>(partition_count)) {
+          partition_id = static_cast<unsigned>(partition_count - 1);
+        }
+        coarse_partition(i) = partition_id;
+      });
 
   Kokkos::parallel_for(
       "uncoarsen_partition", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
@@ -104,6 +123,44 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
       KOKKOS_LAMBDA(const int i) {
         const unsigned partition_id = state.partition(i);
         Kokkos::atomic_add(&state.partition_wgt(partition_id), level0.vwgt(i));
+      });
+
+  Kokkos::parallel_for(
+      "compute_refinement_candidates", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+      KOKKOS_LAMBDA(const int i) {
+        const unsigned partition_id = state.partition(i);
+        const unsigned edge_begin = level0.adjp(i);
+        const unsigned edge_end = level0.adjp(i + 1);
+
+        int internal_weight = 0;
+        int external_weight = 0;
+        unsigned selected_target = partition_id;
+        int best_target_weight = -1;
+
+        for (unsigned e = edge_begin; e < edge_end; ++e) {
+          const unsigned neighbor_raw = level0.adjncy(e);
+          if (neighbor_raw == 0 || neighbor_raw > num_vertices) {
+            continue;
+          }
+
+          const unsigned neighbor = neighbor_raw - 1;
+          const unsigned edge_weight = level0.adjwgt(e);
+          const unsigned neighbor_partition = state.partition(neighbor);
+          if (neighbor_partition == partition_id) {
+            internal_weight += static_cast<int>(edge_weight);
+            continue;
+          }
+
+          external_weight += static_cast<int>(edge_weight);
+          if (static_cast<int>(edge_weight) > best_target_weight) {
+            best_target_weight = static_cast<int>(edge_weight);
+            selected_target = neighbor_partition;
+          }
+        }
+
+        refine.gain(i) = external_weight - internal_weight;
+        refine.target_partition(i) = selected_target;
+        refine.move_flag(i) = (selected_target != partition_id && refine.gain(i) > 0) ? 1u : 0u;
       });
 
   unsigned long long total_cut = 0;

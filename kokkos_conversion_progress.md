@@ -123,6 +123,13 @@ Latest observed pipeline output:
 - Implemented host-side coarse partition initialization using coarse vertex weights with deterministic lightest-bucket assignment.
 - Implemented uncoarsening propagation from coarse partitions back to fine partitions via `cmap`.
 - Extended lineage output from `PartitionID,L0` to `PartitionID,L1,L0`.
+- Replaced host coarse initializer with Kokkos-native weighted-prefix partition assignment.
+  - coarse partition IDs now computed in Kokkos from prefix weights and total coarse weight
+  - implemented in `kokkos_port/src/pipeline_stub.cpp`
+- Added first refinement-state data path:
+  - introduced `RefinementState` (gain, target partition, move flag)
+  - computes per-vertex gain and move candidates from current adjacency partition context
+  - implemented in `kokkos_port/include/gkway_kokkos/data_model.hpp` and `kokkos_port/src/pipeline_stub.cpp`
 
 ### Validation
 
@@ -136,7 +143,7 @@ python3 kokkos_port/tools/check_levels_invariants.py --levels out_kokkos_stub.le
 
 Observed output:
 
-- `[kokkos_port] phase-1 stub completed for 2897387 vertices, cutsize=19258555, max_partition_wgt=45272`
+- `[kokkos_port] phase-1 stub completed for 2897387 vertices, cutsize=1251296, max_partition_wgt=45272`
 - `PASS: rows=2897387 columns=3`
 
 Result: PASS (one-level coarsen/uncoarsen path is functional)
@@ -145,6 +152,8 @@ Result: PASS (one-level coarsen/uncoarsen path is functional)
 
 ### Completed So Far
 
+- Updated migration direction to keep both CUDA and Kokkos pathways in the repo.
+  - reflected in `convert_kokkos.md` Phase 5 tasks
 - Added explicit multilevel consistency checker:
   - `kokkos_port/tools/check_multilevel_consistency.py`
   - validates `L1 -> PartitionID` consistency
@@ -169,6 +178,10 @@ Observed output:
 
 Result: PASS (hardening checks active and passing)
 
+Latest observed hardening output:
+
+- `PASS: coarse_vertices=1448694 max_group_size=2 partition_consistency=ok`
+
 ### Remaining for Phase 2
 
 - Replace remaining placeholder logic in orchestration with real multilevel state flow.
@@ -179,6 +192,5 @@ Result: PASS (hardening checks active and passing)
 
 Phase 4/5 milestone C:
 
-- move coarse partition initialization from host loop into Kokkos execution path
 - add coarsened weight conservation checker to tooling
-- prepare first refinement-state struct for gain/move bookkeeping
+- apply first move-candidate pass and report move-count diagnostics

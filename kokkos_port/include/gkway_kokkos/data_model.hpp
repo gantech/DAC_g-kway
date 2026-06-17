@@ -36,4 +36,15 @@ struct PartitionState {
   view_u cutsize;
 };
 
+template <typename ExecSpace>
+struct RefinementState {
+  using memory_space = typename ExecSpace::memory_space;
+  using view_u = Kokkos::View<unsigned*, memory_space>;
+  using view_i = Kokkos::View<int*, memory_space>;
+
+  view_i gain;
+  view_u target_partition;
+  view_u move_flag;
+};
+
 }  // namespace gkway_kokkos
