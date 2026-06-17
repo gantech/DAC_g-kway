@@ -142,6 +142,9 @@ Latest observed pipeline output:
   - proposal acceptance is parity-gated per pass for deterministic concurrent move filtering
   - move proposals are rejected when target partition exceeds a computed/ configured weight cap
   - partition weights are recomputed each pass before candidate evaluation
+- Added per-pass and balance diagnostics to pipeline output:
+  - `executed_refinement_passes`, `last_pass_moves`
+  - `min_partition_wgt`, `avg_partition_wgt`, `partition_wgt_cap`
 
 ### Validation
 
@@ -155,7 +158,7 @@ python3 kokkos_port/tools/check_levels_invariants.py --levels out_kokkos_stub.le
 
 Observed output:
 
-- `[kokkos_port] phase-1 stub completed for 2897387 vertices, cutsize=1197861, max_partition_wgt=45599, proposed_moves=56758, refinement_passes=3`
+- `[kokkos_port] phase-1 stub completed for 2897387 vertices, cutsize=1197861, max_partition_wgt=45599, proposed_moves=56758, refinement_passes=3, executed_refinement_passes=3, last_pass_moves=13783, min_partition_wgt=44955, avg_partition_wgt=45271, partition_wgt_cap=47536`
 - `PASS: rows=2897387 columns=3`
 
 Result: PASS (one-level coarsen/uncoarsen path is functional)
@@ -177,6 +180,9 @@ Result: PASS (one-level coarsen/uncoarsen path is functional)
   - validates `L0 -> L1` pairwise mapping, full L0 coverage, and total fine/coarse weight conservation
 - Wired coarsened-weight conservation checker into phase compare workflow:
   - `kokkos_port/tools/run_phase1_compare.sh` now requires `<graph_file>` input
+- Extended compare harness with optional strict coarse-consistency mode:
+  - relaxed mode remains default for post-refinement snapshots
+  - strict mode can be enabled with a trailing `1` argument for pre-refinement snapshots
 
 ### Validation
 
@@ -193,6 +199,7 @@ Observed output:
 - `PASS: rows=2897387 columns=3`
 - `PASS: coarse_vertices=1448694 max_group_size=2 mixed_partition_coarse_vertices=36620`
 - `PASS: fine_vertices=2897387 coarse_vertices=1448694 fine_total_weight=4108790870859 coarse_total_weight=4108790870859`
+- strict compare harness smoke test on current post-refinement snapshot: `FAIL: coarse partition consistency violated for 34179 coarse vertices`
 
 Result: PASS (hardening checks active and passing)
 
@@ -208,7 +215,6 @@ Latest observed hardening output:
 
 ## Planned Next Milestone
 
-Phase 4/5 milestone F:
+Phase 4/5 milestone H:
 
-- add per-pass diagnostics export for accepted moves and partition imbalance
-- add strict-mode compare harness path for pre-refinement snapshots
+- add optional snapshot export for pre- and post-refinement partition states
