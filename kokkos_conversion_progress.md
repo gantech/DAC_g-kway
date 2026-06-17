@@ -9,7 +9,7 @@ Last updated: 2026-06-17
 - Phase 2 (Memory and Orchestration Port): In progress
 - Phase 3 (Coarsening Port): In progress
 - Phase 4 (Uncoarsening and Refinement Port): In progress
-- Phase 5 (Hardening and Cleanup): Not started
+- Phase 5 (Hardening and Cleanup): In progress
 
 ## Phase 0: Feasibility and Baseline
 
@@ -141,6 +141,34 @@ Observed output:
 
 Result: PASS (one-level coarsen/uncoarsen path is functional)
 
+## Phase 5: Hardening and Cleanup
+
+### Completed So Far
+
+- Added explicit multilevel consistency checker:
+  - `kokkos_port/tools/check_multilevel_consistency.py`
+  - validates `L1 -> PartitionID` consistency
+  - validates pairwise coarse grouping invariants (`max_group_size <= 2`, consecutive pairs)
+- Wired consistency checker into phase compare workflow:
+  - `kokkos_port/tools/run_phase1_compare.sh`
+
+### Validation
+
+Executed:
+
+```bash
+./build-kokkos/exec/gkway-kokkos mesh_graph.metis 64 out_kokkos_stub
+python3 kokkos_port/tools/check_levels_invariants.py --levels out_kokkos_stub.levels --num-partitions 64
+python3 kokkos_port/tools/check_multilevel_consistency.py --levels out_kokkos_stub.levels
+```
+
+Observed output:
+
+- `PASS: rows=2897387 columns=3`
+- `PASS: coarse_vertices=1448694 max_group_size=2 partition_consistency=ok`
+
+Result: PASS (hardening checks active and passing)
+
 ### Remaining for Phase 2
 
 - Replace remaining placeholder logic in orchestration with real multilevel state flow.
@@ -149,8 +177,8 @@ Result: PASS (one-level coarsen/uncoarsen path is functional)
 
 ## Planned Next Milestone
 
-Phase 4 milestone B:
+Phase 4/5 milestone C:
 
 - move coarse partition initialization from host loop into Kokkos execution path
-- add explicit per-level invariant checks for `cmap` and coarsened weight conservation
+- add coarsened weight conservation checker to tooling
 - prepare first refinement-state struct for gain/move bookkeeping

@@ -20,3 +20,6 @@ python3 "${script_dir}/compare_with_baseline.py" \
 python3 "${script_dir}/check_levels_invariants.py" \
   --levels "${levels_file}" \
   --num-partitions "${num_partitions}"
+
+python3 "${script_dir}/check_multilevel_consistency.py" \
+  --levels "${levels_file}"
