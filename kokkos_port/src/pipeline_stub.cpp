@@ -125,59 +125,68 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
         Kokkos::atomic_add(&state.partition_wgt(partition_id), level0.vwgt(i));
       });
 
-  Kokkos::parallel_for(
-      "compute_refinement_candidates", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
-      KOKKOS_LAMBDA(const int i) {
-        const unsigned partition_id = state.partition(i);
-        const unsigned edge_begin = level0.adjp(i);
-        const unsigned edge_end = level0.adjp(i + 1);
-
-        int internal_weight = 0;
-        int external_weight = 0;
-        unsigned selected_target = partition_id;
-        int best_target_weight = -1;
-
-        for (unsigned e = edge_begin; e < edge_end; ++e) {
-          const unsigned neighbor_raw = level0.adjncy(e);
-          if (neighbor_raw == 0 || neighbor_raw > num_vertices) {
-            continue;
-          }
-
-          const unsigned neighbor = neighbor_raw - 1;
-          const unsigned edge_weight = level0.adjwgt(e);
-          const unsigned neighbor_partition = state.partition(neighbor);
-          if (neighbor_partition == partition_id) {
-            internal_weight += static_cast<int>(edge_weight);
-            continue;
-          }
-
-          external_weight += static_cast<int>(edge_weight);
-          if (static_cast<int>(edge_weight) > best_target_weight) {
-            best_target_weight = static_cast<int>(edge_weight);
-            selected_target = neighbor_partition;
-          }
-        }
-
-        refine.gain(i) = external_weight - internal_weight;
-        refine.target_partition(i) = selected_target;
-        refine.move_flag(i) = (selected_target != partition_id && refine.gain(i) > 0) ? 1u : 0u;
-      });
-
   unsigned long long proposed_moves = 0;
-  Kokkos::parallel_reduce(
-      "count_proposed_moves", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
-      KOKKOS_LAMBDA(const int i, unsigned long long& local_count) {
-        local_count += static_cast<unsigned long long>(refine.move_flag(i));
-      },
-      proposed_moves);
+  const int refinement_passes = options.refinement_passes > 0 ? options.refinement_passes : 1;
+  for (int pass = 0; pass < refinement_passes; ++pass) {
+    Kokkos::parallel_for(
+        "compute_refinement_candidates", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+        KOKKOS_LAMBDA(const int i) {
+          const unsigned partition_id = state.partition(i);
+          const unsigned edge_begin = level0.adjp(i);
+          const unsigned edge_end = level0.adjp(i + 1);
 
-  Kokkos::parallel_for(
-      "apply_refinement_moves", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
-      KOKKOS_LAMBDA(const int i) {
-        if (refine.move_flag(i) != 0u) {
-          state.partition(i) = refine.target_partition(i);
-        }
-      });
+          int internal_weight = 0;
+          int external_weight = 0;
+          unsigned selected_target = partition_id;
+          int best_target_weight = -1;
+
+          for (unsigned e = edge_begin; e < edge_end; ++e) {
+            const unsigned neighbor_raw = level0.adjncy(e);
+            if (neighbor_raw == 0 || neighbor_raw > num_vertices) {
+              continue;
+            }
+
+            const unsigned neighbor = neighbor_raw - 1;
+            const unsigned edge_weight = level0.adjwgt(e);
+            const unsigned neighbor_partition = state.partition(neighbor);
+            if (neighbor_partition == partition_id) {
+              internal_weight += static_cast<int>(edge_weight);
+              continue;
+            }
+
+            external_weight += static_cast<int>(edge_weight);
+            if (static_cast<int>(edge_weight) > best_target_weight) {
+              best_target_weight = static_cast<int>(edge_weight);
+              selected_target = neighbor_partition;
+            }
+          }
+
+          refine.gain(i) = external_weight - internal_weight;
+          refine.target_partition(i) = selected_target;
+          refine.move_flag(i) = (selected_target != partition_id && refine.gain(i) > 0) ? 1u : 0u;
+        });
+
+    unsigned long long pass_moves = 0;
+    Kokkos::parallel_reduce(
+        "count_proposed_moves", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+        KOKKOS_LAMBDA(const int i, unsigned long long& local_count) {
+          local_count += static_cast<unsigned long long>(refine.move_flag(i));
+        },
+        pass_moves);
+
+    proposed_moves += pass_moves;
+    if (pass_moves == 0) {
+      break;
+    }
+
+    Kokkos::parallel_for(
+        "apply_refinement_moves", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+        KOKKOS_LAMBDA(const int i) {
+          if (refine.move_flag(i) != 0u) {
+            state.partition(i) = refine.target_partition(i);
+          }
+        });
+  }
 
   Kokkos::deep_copy(state.partition_wgt, 0u);
   Kokkos::parallel_for(
@@ -251,7 +260,8 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
   std::cout << "[kokkos_port] phase-1 stub completed for " << num_vertices
             << " vertices, cutsize=" << h_cutsize(0)
             << ", max_partition_wgt=" << max_partition_wgt
-            << ", proposed_moves=" << proposed_moves << "\n";
+            << ", proposed_moves=" << proposed_moves
+            << ", refinement_passes=" << refinement_passes << "\n";
 }
 
 template void run_pipeline_stub<Kokkos::DefaultExecutionSpace>(const RunOptions& options,

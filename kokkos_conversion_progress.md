@@ -134,6 +134,10 @@ Latest observed pipeline output:
   - applies positive-gain move candidates once
   - recomputes partition weights post-move
   - reports `proposed_moves` diagnostic in pipeline output
+- Extended refinement to configurable multi-pass iteration:
+  - CLI now accepts optional `refinement_passes` argument
+  - pipeline runs repeated candidate/move rounds with early stop when no moves are proposed
+  - reports `refinement_passes` in pipeline diagnostics
 
 ### Validation
 
@@ -147,7 +151,7 @@ python3 kokkos_port/tools/check_levels_invariants.py --levels out_kokkos_stub.le
 
 Observed output:
 
-- `[kokkos_port] phase-1 stub completed for 2897387 vertices, cutsize=1251296, max_partition_wgt=45272`
+- `[kokkos_port] phase-1 stub completed for 2897387 vertices, cutsize=1201153, max_partition_wgt=45590, proposed_moves=73207, refinement_passes=2`
 - `PASS: rows=2897387 columns=3`
 
 Result: PASS (one-level coarsen/uncoarsen path is functional)
@@ -200,7 +204,7 @@ Latest observed hardening output:
 
 ## Planned Next Milestone
 
-Phase 4/5 milestone D:
+Phase 4/5 milestone E:
 
-- add iterative refinement rounds with configurable pass count
 - add deterministic conflict-resolution mode for concurrent move proposals
+- add partition-balance guardrails in move acceptance path

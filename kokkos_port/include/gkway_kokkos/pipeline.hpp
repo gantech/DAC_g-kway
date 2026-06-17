@@ -10,6 +10,7 @@ struct RunOptions {
   std::string graph_file;
   int num_partitions = 0;
   std::string out_prefix;
+  int refinement_passes = 1;
 };
 
 template <typename ExecSpace>
