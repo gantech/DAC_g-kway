@@ -183,6 +183,10 @@ Result: PASS (one-level coarsen/uncoarsen path is functional)
 - Extended compare harness with optional strict coarse-consistency mode:
   - relaxed mode remains default for post-refinement snapshots
   - strict mode can be enabled with a trailing `1` argument for pre-refinement snapshots
+- Added automatic refinement snapshots in pipeline output:
+  - writes `.pre_refine.out/.levels` before refinement
+  - writes `.post_refine.out/.levels` after refinement
+- Strict compare mode now auto-routes to `.pre_refine.levels` when present
 
 ### Validation
 
@@ -199,7 +203,7 @@ Observed output:
 - `PASS: rows=2897387 columns=3`
 - `PASS: coarse_vertices=1448694 max_group_size=2 mixed_partition_coarse_vertices=36620`
 - `PASS: fine_vertices=2897387 coarse_vertices=1448694 fine_total_weight=4108790870859 coarse_total_weight=4108790870859`
-- strict compare harness smoke test on current post-refinement snapshot: `FAIL: coarse partition consistency violated for 34179 coarse vertices`
+- strict compare harness on pre-refinement snapshot: `PASS: coarse_vertices=1448694 max_group_size=2 mixed_partition_coarse_vertices=0`
 
 Result: PASS (hardening checks active and passing)
 
@@ -215,6 +219,6 @@ Latest observed hardening output:
 
 ## Planned Next Milestone
 
-Phase 4/5 milestone H:
+Phase 4/5 milestone I:
 
-- add optional snapshot export for pre- and post-refinement partition states
+- add contributor playbook for Kokkos kernel conventions, testing, and profiling

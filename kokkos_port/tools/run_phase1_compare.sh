@@ -34,9 +34,16 @@ multilevel_args=(
   --levels "${levels_file}"
 )
 
+strict_levels_file="${levels_file}"
+if [[ "${strict_mode}" == "1" && -f "${candidate_prefix}.pre_refine.levels" ]]; then
+  strict_levels_file="${candidate_prefix}.pre_refine.levels"
+fi
+
 if [[ "${strict_mode}" == "1" ]]; then
   multilevel_args+=(--require-coarse-partition-consistency)
 fi
+
+multilevel_args[2]="${strict_levels_file}"
 
 python3 "${multilevel_args[@]}"
 

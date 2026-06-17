@@ -27,6 +27,21 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
     return;
   }
 
+  auto write_outputs = [&](const std::string& prefix,
+                           const Kokkos::View<unsigned*, Kokkos::HostSpace>& partition_host,
+                           const Kokkos::View<unsigned*, Kokkos::HostSpace>& cmap_host) {
+    std::ofstream out_part(prefix + ".out");
+    for (std::size_t i = 0; i < num_vertices; ++i) {
+      out_part << partition_host(i) << '\n';
+    }
+
+    std::ofstream out_levels(prefix + ".levels");
+    out_levels << "PartitionID,L1,L0\n";
+    for (std::size_t i = 0; i < num_vertices; ++i) {
+      out_levels << partition_host(i) << ',' << cmap_host(i) << ',' << (i + 1) << '\n';
+    }
+  };
+
   GraphLevel<ExecSpace> level0;
   level0.num_vertices = num_vertices;
   level0.num_edges = host_graph.num_edges;
@@ -131,6 +146,10 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
         const unsigned partition_id = state.partition(i);
         Kokkos::atomic_add(&state.partition_wgt(partition_id), level0.vwgt(i));
       });
+
+  auto pre_refine_partition = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.partition);
+  auto pre_refine_cmap = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), level0.cmap);
+  write_outputs(options.out_prefix + ".pre_refine", pre_refine_partition, pre_refine_cmap);
 
   unsigned long long proposed_moves = 0;
   unsigned long long last_pass_moves = 0;
@@ -264,20 +283,8 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
   auto h_partition_wgt = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.partition_wgt);
   auto h_cutsize = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.cutsize);
 
-  {
-    std::ofstream out_part(options.out_prefix + ".out");
-    for (std::size_t i = 0; i < num_vertices; ++i) {
-      out_part << h_partition(i) << '\n';
-    }
-  }
-
-  {
-    std::ofstream out_levels(options.out_prefix + ".levels");
-    out_levels << "PartitionID,L1,L0\n";
-    for (std::size_t i = 0; i < num_vertices; ++i) {
-      out_levels << h_partition(i) << ',' << h_cmap(i) << ',' << (i + 1) << '\n';
-    }
-  }
+  write_outputs(options.out_prefix, h_partition, h_cmap);
+  write_outputs(options.out_prefix + ".post_refine", h_partition, h_cmap);
 
   unsigned max_partition_wgt = 0;
   unsigned min_partition_wgt = h_partition_wgt.extent(0) > 0 ? h_partition_wgt(0) : 0;
