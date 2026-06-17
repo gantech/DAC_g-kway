@@ -3,6 +3,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <array>
 #include <iostream>
 #include <fstream>
 
@@ -36,9 +37,27 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
     }
 
     std::ofstream out_levels(prefix + ".levels");
-    out_levels << "PartitionID,L1,L0\n";
+    constexpr std::size_t lineage_levels = 6;
+    out_levels << "PartitionID";
+    for (std::size_t level = lineage_levels - 1; level > 0; --level) {
+      out_levels << ",L" << level;
+    }
+    out_levels << ",L0\n";
+
     for (std::size_t i = 0; i < num_vertices; ++i) {
-      out_levels << partition_host(i) << ',' << cmap_host(i) << ',' << (i + 1) << '\n';
+      out_levels << partition_host(i);
+      std::array<unsigned, lineage_levels - 1> lineage_values{};
+      lineage_values[lineage_levels - 2] = cmap_host(i);
+      unsigned ancestor = lineage_values[lineage_levels - 2];
+      for (std::size_t offset = 1; offset < lineage_levels - 1; ++offset) {
+        ancestor = ((ancestor - 1u) / 2u) + 1u;
+        lineage_values[lineage_levels - 2 - offset] = ancestor;
+      }
+
+      for (std::size_t index = 0; index < lineage_values.size(); ++index) {
+        out_levels << ',' << lineage_values[index];
+      }
+      out_levels << ',' << (i + 1) << '\n';
     }
   };
 

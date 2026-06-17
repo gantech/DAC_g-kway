@@ -74,19 +74,19 @@ def main():
         fail("levels file must include header and at least one data row")
 
     header = rows[0]
-    if header != ["PartitionID", "L1", "L0"]:
-        fail(f"expected header ['PartitionID', 'L1', 'L0'], found {header}")
+    if len(header) < 3 or header[0] != "PartitionID" or header[-1] != "L0":
+        fail(f"expected header to start with PartitionID and end with L0, found {header}")
 
     seen_l0 = set()
     coarse_weight = defaultdict(int)
 
     for idx, row in enumerate(rows[1:], start=2):
-        if len(row) != 3:
-            fail(f"row {idx}: expected 3 columns, found {len(row)}")
+        if len(row) < 3:
+            fail(f"row {idx}: expected at least 3 columns, found {len(row)}")
 
         try:
-            l1 = int(row[1])
-            l0 = int(row[2])
+            l1 = int(row[-2])
+            l0 = int(row[-1])
         except ValueError:
             fail(f"row {idx}: L1 and L0 must be integers")
 

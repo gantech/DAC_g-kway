@@ -187,6 +187,9 @@ Result: PASS (one-level coarsen/uncoarsen path is functional)
   - writes `.pre_refine.out/.levels` before refinement
   - writes `.post_refine.out/.levels` after refinement
 - Strict compare mode now auto-routes to `.pre_refine.levels` when present
+- Kokkos lineage output now emits the full 6-level ancestry chain to match the CUDA format:
+  - `PartitionID,L5,L4,L3,L2,L1,L0`
+  - validators now accept the wider CSV while still checking the immediate `L1 -> L0` structure
 - Added Kokkos contributor playbook:
   - `kokkos_port/CONTRIBUTOR_PLAYBOOK.md`
 

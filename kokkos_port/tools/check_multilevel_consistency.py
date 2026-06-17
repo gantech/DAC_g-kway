@@ -33,20 +33,20 @@ def main():
         fail("levels file must include header and data rows")
 
     header = rows[0]
-    if header != ["PartitionID", "L1", "L0"]:
-        fail(f"expected header ['PartitionID', 'L1', 'L0'], found {header}")
+    if len(header) < 3 or header[0] != "PartitionID" or header[-1] != "L0":
+        fail(f"expected header to start with PartitionID and end with L0, found {header}")
 
     coarse_to_partitions = defaultdict(set)
     coarse_to_fine = defaultdict(list)
 
     for idx, row in enumerate(rows[1:], start=2):
-        if len(row) != 3:
-            fail(f"row {idx}: expected 3 columns, found {len(row)}")
+        if len(row) < 3:
+            fail(f"row {idx}: expected at least 3 columns, found {len(row)}")
 
         try:
             partition_id = int(row[0])
-            level1_id = int(row[1])
-            level0_id = int(row[2])
+            level1_id = int(row[-2])
+            level0_id = int(row[-1])
         except ValueError:
             fail(f"row {idx}: all values must be integers")
 
@@ -56,7 +56,6 @@ def main():
             fail(f"row {idx}: L0 must be positive")
 
         coarse_to_partitions[level1_id].add(partition_id)
-
         coarse_to_fine[level1_id].append(level0_id)
 
     max_group_size = 0
