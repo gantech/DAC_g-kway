@@ -135,7 +135,8 @@ void uncoarsening(std::vector<unsigned>& coarsen_num_vertices_vec, std::vector<u
                   std::vector<unsigned>& global_edge_offset_vec, unsigned* d_partition, unsigned* d_if_boundary,
                   unsigned* d_adjncy, unsigned* d_adjwgt, unsigned* d_adjp, unsigned* d_cmap, unsigned* d_partition_wgt, 
                   unsigned* d_cutsize, unsigned* d_vwgt, const int NUM_PARTITIONS, const unsigned MAX_NUM_VERTICES, 
-                  const unsigned MAX_NUM_EDGES, cudaStream_t stream1, mgpu::context_t& context) {
+                  const unsigned MAX_NUM_EDGES, cudaStream_t stream1, mgpu::context_t& context,
+                  std::vector<std::vector<unsigned>>& partition_snapshots) {
    
    unsigned* d_if_updated_vertex;
    unsigned* d_max_gain_partition;
@@ -171,6 +172,14 @@ void uncoarsening(std::vector<unsigned>& coarsen_num_vertices_vec, std::vector<u
    unsigned coarsen_it = coarsen_num_vertices_vec.size();
    unsigned num_finer_vertex, num_finer_edge, num_coarsen_vertex, num_coarsen_edge, global_vertex_offset, global_ptr_offset, global_edge_offset;
 
+  {
+   std::vector<unsigned> coarsest_partition(coarsen_num_vertices_vec.back());
+   check_cuda(cudaMemcpy(coarsest_partition.data(), d_partition,
+                  sizeof(unsigned) * coarsen_num_vertices_vec.back(),
+                  cudaMemcpyDeviceToHost));
+   partition_snapshots.push_back(std::move(coarsest_partition));
+  }
+
    for(unsigned i = 0; i < (coarsen_it - 1); ++i) {
 
     num_finer_vertex = coarsen_num_vertices_vec[coarsen_it - 2 - i];
@@ -189,6 +198,12 @@ void uncoarsening(std::vector<unsigned>& coarsen_num_vertices_vec, std::vector<u
                    d_adjwgt+global_edge_offset, d_buffer_size, hp_buffer_size, d_pos, d_op_result, hp_pos, hp_op_result, 
                    d_if_boundary, d_vertex_gain, d_max_gain_partition, d_if_updated_vertex, d_cutsize, d_mv_buffer, 
                    d_mv_delta_partition_wgt, d_mv_balance_sequence, num_finer_vertex, num_finer_edge, NUM_PARTITIONS, stream1, context);
+
+    std::vector<unsigned> finer_partition(num_finer_vertex);
+    check_cuda(cudaMemcpy(finer_partition.data(), d_partition,
+                sizeof(unsigned) * num_finer_vertex,
+                cudaMemcpyDeviceToHost));
+    partition_snapshots.push_back(std::move(finer_partition));
   }
   
    unsigned num_block = (num_finer_vertex + THREAD_PER_BLOCK - 1) / THREAD_PER_BLOCK;
@@ -217,6 +232,115 @@ void uncoarsening(std::vector<unsigned>& coarsen_num_vertices_vec, std::vector<u
   cudaFreeHost(hp_op_result);
   cudaFreeHost(hp_pos);
   cudaFree(d_pos);
+}
+
+void dump_multilevel_lineage(const std::string& out_file,
+                             const std::vector<unsigned>& coarsen_num_vertices_vec,
+                             unsigned* d_cmap,
+                             unsigned* d_partition) {
+  if(coarsen_num_vertices_vec.empty()) {
+    return;
+  }
+
+  const size_t num_levels = coarsen_num_vertices_vec.size();
+  const size_t num_vertices = coarsen_num_vertices_vec.front();
+  size_t cmap_size = 0;
+  std::vector<size_t> cmap_offsets;
+  cmap_offsets.reserve(num_levels > 0 ? num_levels - 1 : 0);
+
+  for(size_t level = 0; level + 1 < num_levels; ++level) {
+    cmap_offsets.push_back(cmap_size);
+    cmap_size += coarsen_num_vertices_vec[level];
+  }
+
+  std::vector<unsigned> h_cmap(cmap_size);
+  std::vector<unsigned> h_partition(num_vertices);
+  if(cmap_size > 0) {
+    check_cuda(cudaMemcpy(h_cmap.data(), d_cmap, sizeof(unsigned) * cmap_size, cudaMemcpyDeviceToHost));
+  }
+  check_cuda(cudaMemcpy(h_partition.data(), d_partition, sizeof(unsigned) * num_vertices, cudaMemcpyDeviceToHost));
+
+  std::ofstream out_stream(out_file + ".levels");
+  if(!out_stream) {
+    std::cerr << "can't open multilevel output file\n";
+    return;
+  }
+
+  out_stream << "PartitionID";
+  for(size_t level = num_levels - 1; level >= 1; --level) {
+    out_stream << ",L" << level;
+    if(level == 1) {
+      break;
+    }
+  }
+  out_stream << ",L0";
+  out_stream << '\n';
+
+  for(size_t vertex = 0; vertex < num_vertices; ++vertex) {
+    unsigned current_vertex = static_cast<unsigned>(vertex + 1);
+    std::vector<unsigned> level_vertices;
+    level_vertices.reserve(num_levels > 0 ? num_levels - 1 : 0);
+    for(size_t level = 0; level + 1 < num_levels; ++level) {
+      current_vertex = h_cmap[cmap_offsets[level] + current_vertex - 1];
+      level_vertices.push_back(current_vertex);
+    }
+
+    out_stream << h_partition[vertex];
+    for(size_t i = level_vertices.size(); i > 0; --i) {
+      out_stream << ',' << level_vertices[i - 1];
+    }
+    out_stream << ',' << (vertex + 1);
+    out_stream << '\n';
+  }
+
+  out_stream.close();
+}
+
+void dump_partition_snapshots(const std::string& out_file,
+                              const std::vector<unsigned>& coarsen_num_vertices_vec,
+                              unsigned* d_cmap,
+                              const std::vector<std::vector<unsigned>>& partition_snapshots) {
+  if(coarsen_num_vertices_vec.empty() || partition_snapshots.empty()) {
+    return;
+  }
+
+  const size_t num_levels = coarsen_num_vertices_vec.size();
+  if(partition_snapshots.size() != num_levels) {
+    std::cerr << "snapshot count does not match the number of levels\n";
+    return;
+  }
+
+  const size_t num_vertices = coarsen_num_vertices_vec.front();
+  size_t cmap_size = 0;
+  std::vector<size_t> cmap_offsets;
+  cmap_offsets.reserve(num_levels > 0 ? num_levels - 1 : 0);
+
+  for(size_t level = 0; level + 1 < num_levels; ++level) {
+    cmap_offsets.push_back(cmap_size);
+    cmap_size += coarsen_num_vertices_vec[level];
+  }
+
+  std::vector<unsigned> h_cmap(cmap_size);
+  if(cmap_size > 0) {
+    check_cuda(cudaMemcpy(h_cmap.data(), d_cmap, sizeof(unsigned) * cmap_size, cudaMemcpyDeviceToHost));
+  }
+
+  std::ofstream out_stream(out_file + ".snapshots");
+  if(!out_stream) {
+    std::cerr << "can't open snapshot output file\n";
+    return;
+  }
+
+  for(size_t snapshot_index = 0; snapshot_index < num_levels; ++snapshot_index) {
+    const size_t level = num_levels - 1 - snapshot_index;
+    out_stream << "LEVEL L" << level << " vertices=" << coarsen_num_vertices_vec[snapshot_index] << '\n';
+    for(size_t vertex = 0; vertex < partition_snapshots[snapshot_index].size(); ++vertex) {
+      out_stream << (vertex + 1) << ' ' << partition_snapshots[snapshot_index][vertex] << '\n';
+    }
+    out_stream << '\n';
+  }
+
+  out_stream.close();
 }
 
 void graph_partitioner(const std::string& GRAPH_FILE, const std::string& OUT_FILE, const int NUM_PARTITIONS) {
@@ -325,11 +449,14 @@ void graph_partitioner(const std::string& GRAPH_FILE, const std::string& OUT_FIL
   std::cout << "coarsen_num_vertices: " << coarsen_num_vertices << '\n';
   cudaStreamSynchronize(stream1);
   auto init_end = std::chrono::system_clock::now();
+
+  std::vector<std::vector<unsigned>> partition_snapshots;
+
   cudaStreamSynchronize(stream1);
   auto refine_start = std::chrono::system_clock::now();
   uncoarsening(coarsen_num_vertices_vec, coarsen_num_edges_vec, global_vertex_offset_vec, global_ptr_offset_vec, global_edge_offset_vec,
                 d_partition, d_if_boundary, d_adjncy, d_adjwgt, d_adjp, d_cmap, d_partition_wgt, d_cutsize,
-                d_vwgt, NUM_PARTITIONS, MAX_NUM_VERTICES, MAX_NUM_EDGES, stream1, context);
+                d_vwgt, NUM_PARTITIONS, MAX_NUM_VERTICES, MAX_NUM_EDGES, stream1, context, partition_snapshots);
 
   auto refine_end = std::chrono::system_clock::now();
   auto end = std::chrono::system_clock::now();
@@ -351,6 +478,7 @@ void graph_partitioner(const std::string& GRAPH_FILE, const std::string& OUT_FIL
   std::vector<int> vertex_partition(MAX_NUM_VERTICES, 0);
   check_cuda(cudaMemcpy(vertex_partition.data(), d_partition, sizeof(int) * MAX_NUM_VERTICES, cudaMemcpyDeviceToHost));
   graph_parser.dump_result(vertex_partition, OUT_FILE);
+  dump_multilevel_lineage(OUT_FILE, coarsen_num_vertices_vec, d_cmap, d_partition);
 
   cudaFree(d_partition);
   cudaFree(d_partition_wgt);
