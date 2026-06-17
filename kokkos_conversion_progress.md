@@ -7,8 +7,8 @@ Last updated: 2026-06-17
 - Phase 0 (Feasibility and Baseline): Completed
 - Phase 1 (Build and Baseline Harness): Completed
 - Phase 2 (Memory and Orchestration Port): In progress
-- Phase 3 (Coarsening Port): Not started
-- Phase 4 (Uncoarsening and Refinement Port): Not started
+- Phase 3 (Coarsening Port): In progress
+- Phase 4 (Uncoarsening and Refinement Port): In progress
 - Phase 5 (Hardening and Cleanup): Not started
 
 ## Phase 0: Feasibility and Baseline
@@ -106,6 +106,41 @@ Latest observed pipeline output:
 
 - `[kokkos_port] phase-1 stub completed for 2897387 vertices, cutsize=20070839, max_partition_wgt=45272`
 
+## Phase 3: Coarsening Port
+
+### Completed So Far
+
+- Implemented deterministic one-level pairwise coarsening map (`fine -> coarse`) in Kokkos:
+  - `L1` IDs now generated from `L0` pair groups
+  - `cmap` semantics remain 1-based for consistency with existing code conventions
+  - implemented in `kokkos_port/src/pipeline_stub.cpp`
+- Added coarse-level vertex-weight aggregation to support coarse partitioning decisions.
+
+## Phase 4: Uncoarsening and Refinement Port
+
+### Completed So Far
+
+- Implemented host-side coarse partition initialization using coarse vertex weights with deterministic lightest-bucket assignment.
+- Implemented uncoarsening propagation from coarse partitions back to fine partitions via `cmap`.
+- Extended lineage output from `PartitionID,L0` to `PartitionID,L1,L0`.
+
+### Validation
+
+Executed:
+
+```bash
+cmake --build build-kokkos --target gkway-kokkos -j2
+./build-kokkos/exec/gkway-kokkos mesh_graph.metis 64 out_kokkos_stub
+python3 kokkos_port/tools/check_levels_invariants.py --levels out_kokkos_stub.levels --num-partitions 64
+```
+
+Observed output:
+
+- `[kokkos_port] phase-1 stub completed for 2897387 vertices, cutsize=19258555, max_partition_wgt=45272`
+- `PASS: rows=2897387 columns=3`
+
+Result: PASS (one-level coarsen/uncoarsen path is functional)
+
 ### Remaining for Phase 2
 
 - Replace remaining placeholder logic in orchestration with real multilevel state flow.
@@ -114,8 +149,8 @@ Latest observed pipeline output:
 
 ## Planned Next Milestone
 
-Phase 2 milestone A:
+Phase 4 milestone B:
 
-- construct level objects from loaded graph with explicit invariants
-- preserve existing output contracts (`.out`, `.levels`) while reducing stub logic
-- keep CI-like local validation command sequence passing
+- move coarse partition initialization from host loop into Kokkos execution path
+- add explicit per-level invariant checks for `cmap` and coarsened weight conservation
+- prepare first refinement-state struct for gain/move bookkeeping

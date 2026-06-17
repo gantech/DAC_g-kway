@@ -5,6 +5,7 @@
 
 #include <iostream>
 #include <fstream>
+#include <vector>
 
 namespace gkway_kokkos {
 
@@ -56,12 +57,46 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
   Kokkos::deep_copy(state.if_boundary, 0u);
   Kokkos::deep_copy(state.cutsize, 0u);
 
+  const std::size_t num_coarse_vertices = (num_vertices + 1) / 2;
+  view_u coarse_vwgt("coarse_vwgt", num_coarse_vertices);
+  view_u coarse_partition("coarse_partition", num_coarse_vertices);
+  Kokkos::deep_copy(coarse_vwgt, 0u);
+
   Kokkos::parallel_for(
-      "init_stub_partition", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+      "build_pairwise_cmap", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
       KOKKOS_LAMBDA(const int i) {
-        const int partition_count = config.num_partitions > 0 ? config.num_partitions : 1;
-        state.partition(i) = static_cast<unsigned>(i % partition_count);
-        level0.cmap(i) = static_cast<unsigned>(i + 1);
+        const unsigned coarse_idx = static_cast<unsigned>(i / 2);
+        level0.cmap(i) = coarse_idx + 1;
+        Kokkos::atomic_add(&coarse_vwgt(coarse_idx), level0.vwgt(i));
+      });
+
+  {
+    const int partition_count = config.num_partitions > 0 ? config.num_partitions : 1;
+    auto h_coarse_vwgt = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), coarse_vwgt);
+    auto h_coarse_partition = Kokkos::create_mirror_view(coarse_partition);
+    std::vector<unsigned long long> bucket_wgt(static_cast<std::size_t>(partition_count), 0ull);
+
+    for (std::size_t coarse_idx = 0; coarse_idx < num_coarse_vertices; ++coarse_idx) {
+      int best_partition = 0;
+      for (int candidate = 1; candidate < partition_count; ++candidate) {
+        if (bucket_wgt[static_cast<std::size_t>(candidate)] <
+            bucket_wgt[static_cast<std::size_t>(best_partition)]) {
+          best_partition = candidate;
+        }
+      }
+
+      h_coarse_partition(coarse_idx) = static_cast<unsigned>(best_partition);
+      bucket_wgt[static_cast<std::size_t>(best_partition)] += h_coarse_vwgt(coarse_idx);
+    }
+
+    Kokkos::deep_copy(coarse_partition, h_coarse_partition);
+  }
+
+  Kokkos::parallel_for(
+      "uncoarsen_partition", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+      KOKKOS_LAMBDA(const int i) {
+        const unsigned coarse_idx = level0.cmap(i) - 1;
+        state.partition(i) = coarse_partition(coarse_idx);
       });
 
   Kokkos::parallel_for(
@@ -106,6 +141,7 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
   Kokkos::fence();
 
   auto h_partition = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.partition);
+  auto h_cmap = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), level0.cmap);
   auto h_partition_wgt = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.partition_wgt);
   auto h_cutsize = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.cutsize);
 
@@ -118,9 +154,9 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
 
   {
     std::ofstream out_levels(options.out_prefix + ".levels");
-    out_levels << "PartitionID,L0\n";
+    out_levels << "PartitionID,L1,L0\n";
     for (std::size_t i = 0; i < num_vertices; ++i) {
-      out_levels << h_partition(i) << ',' << (i + 1) << '\n';
+      out_levels << h_partition(i) << ',' << h_cmap(i) << ',' << (i + 1) << '\n';
     }
   }
 
