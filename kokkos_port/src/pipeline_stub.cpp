@@ -133,8 +133,11 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
       });
 
   unsigned long long proposed_moves = 0;
+  unsigned long long last_pass_moves = 0;
+  int executed_refinement_passes = 0;
   const int refinement_passes = options.refinement_passes > 0 ? options.refinement_passes : 1;
   for (int pass = 0; pass < refinement_passes; ++pass) {
+    executed_refinement_passes = pass + 1;
     Kokkos::deep_copy(state.partition_wgt, 0u);
     Kokkos::parallel_for(
         "recompute_partition_weights_pass", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
@@ -199,6 +202,7 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
         },
         pass_moves);
 
+    last_pass_moves = pass_moves;
     proposed_moves += pass_moves;
     if (pass_moves == 0) {
       break;
@@ -276,17 +280,31 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
   }
 
   unsigned max_partition_wgt = 0;
+  unsigned min_partition_wgt = h_partition_wgt.extent(0) > 0 ? h_partition_wgt(0) : 0;
+  unsigned long long total_partition_wgt = 0;
   for (std::size_t p = 0; p < static_cast<std::size_t>(h_partition_wgt.extent(0)); ++p) {
+    total_partition_wgt += static_cast<unsigned long long>(h_partition_wgt(p));
+    if (h_partition_wgt(p) < min_partition_wgt) {
+      min_partition_wgt = h_partition_wgt(p);
+    }
     if (h_partition_wgt(p) > max_partition_wgt) {
       max_partition_wgt = h_partition_wgt(p);
     }
   }
 
+  const unsigned long long avg_partition_wgt =
+      partition_count > 0 ? (total_partition_wgt / static_cast<unsigned long long>(partition_count)) : 0;
+
   std::cout << "[kokkos_port] phase-1 stub completed for " << num_vertices
             << " vertices, cutsize=" << h_cutsize(0)
             << ", max_partition_wgt=" << max_partition_wgt
             << ", proposed_moves=" << proposed_moves
-            << ", refinement_passes=" << refinement_passes << "\n";
+            << ", refinement_passes=" << refinement_passes
+            << ", executed_refinement_passes=" << executed_refinement_passes
+            << ", last_pass_moves=" << last_pass_moves
+            << ", min_partition_wgt=" << min_partition_wgt
+            << ", avg_partition_wgt=" << avg_partition_wgt
+            << ", partition_wgt_cap=" << partition_wgt_cap << "\n";
 }
 
 template void run_pipeline_stub<Kokkos::DefaultExecutionSpace>(const RunOptions& options,
