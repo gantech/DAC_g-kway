@@ -10,7 +10,7 @@ add_executable(gkway-kokkos
   src/pipeline_stub.cpp
 )
 target_include_directories(gkway-kokkos PRIVATE include)
-target_link_libraries(gkway-kokkos PRIVATE Kokkos::kokkos)
+target_link_libraries(gkway-kokkos PRIVATE Kokkos::kokkos ${CMAKE_SOURCE_DIR}/3rd-party/metis/libmetis.so)
 set_target_properties(gkway-kokkos PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/exec")
 
 add_executable(gkway-kokkos-phase0
