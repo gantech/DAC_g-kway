@@ -4,7 +4,8 @@ project(G-KWAY VERSION 1.0)
 
 # set everything up for c++ 17 features
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 86)
+set(CMAKE_CUDA_ARCHITECTURES 90)
+option(GKWAY_ENABLE_KOKKOS_PORT "Build experimental Kokkos port scaffolding" OFF)
 
 # test that filesystem header actually is there and works
 
@@ -21,8 +22,8 @@ target_link_libraries(g-kway stdc++fs)
 # set compilation flags
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 --expt-extended-lambda --stack,10485760")
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --expt-extended-lambda -arch=compute_86 -code=sm_86")
-set(CMAKE_CUDA_FLAGS_DEBUG "-g -G -Xcompiler -lineinfo --expt-extended-lambda -gencode arch=compute_86,code=sm_86")
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --expt-extended-lambda -arch=compute_90 -code=sm_90")
+set(CMAKE_CUDA_FLAGS_DEBUG "-g -G -Xcompiler -lineinfo --expt-extended-lambda -gencode arch=compute_90,code=sm_90")
 #set(CMAKE_CUDA_FLAGS_DEBUG "-g -G -Xcompiler -g -lineinfo --expt-extended-lambda -arch=compute_75 -code=sm_75")
 target_compile_options(g-kway PRIVATE -lstdc++fs --extended-lambda)
 #if (CMAKE_BUILD_TYPE MATCHES "Debug")
@@ -89,5 +90,8 @@ include_directories(${PROJECT_SOURCE_DIR}/3rd-party/)
 
 # add sub directories
 add_subdirectory(main)
+if(GKWAY_ENABLE_KOKKOS_PORT)
+  add_subdirectory(kokkos_port)
+endif()
 #add_subdirectory(unittests)
 

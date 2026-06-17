@@ -1,0 +1,7 @@
+primitive,current_usage_file,replacement_strategy,status,notes
+scan,coarsen.hpp;graph_partitioner.hpp,Kokkos::parallel_scan or KokkosKernels,planned,Phase0 microbench required
+reduce,coarsen.hpp;cuda_check.hpp,Kokkos::parallel_reduce,prototyped,covered by gkway-kokkos-phase0
+sort/mergesort,coarsen.hpp (mgpu::mergesort),TBD (KokkosKernels or custom),open,highest risk item
+segreduce/segsort,moderngpu integration points,TBD custom segmented kernels,open,needs feasibility proof
+compaction,coarsen/uncoarsen helper paths,scan+scatter pattern in Kokkos,prototyped,compaction-like benchmark added
+stream sync,graph_partitioner.hpp,ExecSpace fence,planned,replace cudaStreamSynchronize
