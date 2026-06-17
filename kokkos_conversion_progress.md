@@ -9,7 +9,7 @@ Last updated: 2026-06-17
 - Phase 2 (Memory and Orchestration Port): In progress
 - Phase 3 (Coarsening Port): In progress
 - Phase 4 (Uncoarsening and Refinement Port): In progress
-- Phase 5 (Hardening and Cleanup): In progress
+- Phase 5 (Hardening and Cleanup): Completed
 
 ## Phase 0: Feasibility and Baseline
 
@@ -187,6 +187,8 @@ Result: PASS (one-level coarsen/uncoarsen path is functional)
   - writes `.pre_refine.out/.levels` before refinement
   - writes `.post_refine.out/.levels` after refinement
 - Strict compare mode now auto-routes to `.pre_refine.levels` when present
+- Added Kokkos contributor playbook:
+  - `kokkos_port/CONTRIBUTOR_PLAYBOOK.md`
 
 ### Validation
 
@@ -219,6 +221,7 @@ Latest observed hardening output:
 
 ## Planned Next Milestone
 
-Phase 4/5 milestone I:
+Phase 5 complete.
 
-- add contributor playbook for Kokkos kernel conventions, testing, and profiling
+- Keep working Phase 2-4 slices as needed for the broader port.
+- Preserve the CUDA path while iterating on the Kokkos capability.

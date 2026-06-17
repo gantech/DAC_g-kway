@@ -141,6 +141,7 @@ Tasks:
 1. Keep CUDA and Kokkos pathways side-by-side; do not remove CUDA path.
 2. Remove temporary migration scaffolding.
 3. Add contributor playbook for Kokkos kernel conventions, testing, and profiling.
+	- done: `kokkos_port/CONTRIBUTOR_PLAYBOOK.md`
 
 Exit criteria:
 
