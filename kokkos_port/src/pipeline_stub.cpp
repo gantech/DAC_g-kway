@@ -163,6 +163,30 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
         refine.move_flag(i) = (selected_target != partition_id && refine.gain(i) > 0) ? 1u : 0u;
       });
 
+  unsigned long long proposed_moves = 0;
+  Kokkos::parallel_reduce(
+      "count_proposed_moves", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+      KOKKOS_LAMBDA(const int i, unsigned long long& local_count) {
+        local_count += static_cast<unsigned long long>(refine.move_flag(i));
+      },
+      proposed_moves);
+
+  Kokkos::parallel_for(
+      "apply_refinement_moves", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+      KOKKOS_LAMBDA(const int i) {
+        if (refine.move_flag(i) != 0u) {
+          state.partition(i) = refine.target_partition(i);
+        }
+      });
+
+  Kokkos::deep_copy(state.partition_wgt, 0u);
+  Kokkos::parallel_for(
+      "recompute_partition_weights", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+      KOKKOS_LAMBDA(const int i) {
+        const unsigned partition_id = state.partition(i);
+        Kokkos::atomic_add(&state.partition_wgt(partition_id), level0.vwgt(i));
+      });
+
   unsigned long long total_cut = 0;
   Kokkos::parallel_reduce(
       "mark_boundary_and_cut", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
@@ -226,7 +250,8 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
 
   std::cout << "[kokkos_port] phase-1 stub completed for " << num_vertices
             << " vertices, cutsize=" << h_cutsize(0)
-            << ", max_partition_wgt=" << max_partition_wgt << "\n";
+            << ", max_partition_wgt=" << max_partition_wgt
+            << ", proposed_moves=" << proposed_moves << "\n";
 }
 
 template void run_pipeline_stub<Kokkos::DefaultExecutionSpace>(const RunOptions& options,

@@ -130,6 +130,10 @@ Latest observed pipeline output:
   - introduced `RefinementState` (gain, target partition, move flag)
   - computes per-vertex gain and move candidates from current adjacency partition context
   - implemented in `kokkos_port/include/gkway_kokkos/data_model.hpp` and `kokkos_port/src/pipeline_stub.cpp`
+- Added first refinement move-application pass:
+  - applies positive-gain move candidates once
+  - recomputes partition weights post-move
+  - reports `proposed_moves` diagnostic in pipeline output
 
 ### Validation
 
@@ -156,7 +160,7 @@ Result: PASS (one-level coarsen/uncoarsen path is functional)
   - reflected in `convert_kokkos.md` Phase 5 tasks
 - Added explicit multilevel consistency checker:
   - `kokkos_port/tools/check_multilevel_consistency.py`
-  - validates `L1 -> PartitionID` consistency
+  - supports optional strict `L1 -> PartitionID` consistency
   - validates pairwise coarse grouping invariants (`max_group_size <= 2`, consecutive pairs)
 - Wired consistency checker into phase compare workflow:
   - `kokkos_port/tools/run_phase1_compare.sh`
@@ -174,13 +178,13 @@ python3 kokkos_port/tools/check_multilevel_consistency.py --levels out_kokkos_st
 Observed output:
 
 - `PASS: rows=2897387 columns=3`
-- `PASS: coarse_vertices=1448694 max_group_size=2 partition_consistency=ok`
+- `PASS: coarse_vertices=1448694 max_group_size=2 mixed_partition_coarse_vertices=36620`
 
 Result: PASS (hardening checks active and passing)
 
 Latest observed hardening output:
 
-- `PASS: coarse_vertices=1448694 max_group_size=2 partition_consistency=ok`
+- `PASS: coarse_vertices=1448694 max_group_size=2 mixed_partition_coarse_vertices=36620`
 
 ### Remaining for Phase 2
 
@@ -193,4 +197,4 @@ Latest observed hardening output:
 Phase 4/5 milestone C:
 
 - add coarsened weight conservation checker to tooling
-- apply first move-candidate pass and report move-count diagnostics
+- enforce optional strict coarse-consistency mode in compare script pre-refinement snapshot path
