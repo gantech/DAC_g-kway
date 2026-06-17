@@ -52,6 +52,10 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
   state.if_boundary = view_u("if_boundary", num_vertices);
   state.cutsize = view_u("cutsize", 1);
 
+  Kokkos::deep_copy(state.partition_wgt, 0u);
+  Kokkos::deep_copy(state.if_boundary, 0u);
+  Kokkos::deep_copy(state.cutsize, 0u);
+
   Kokkos::parallel_for(
       "init_stub_partition", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
       KOKKOS_LAMBDA(const int i) {
@@ -60,9 +64,50 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
         level0.cmap(i) = static_cast<unsigned>(i + 1);
       });
 
+  Kokkos::parallel_for(
+      "accumulate_partition_weights", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+      KOKKOS_LAMBDA(const int i) {
+        const unsigned partition_id = state.partition(i);
+        Kokkos::atomic_add(&state.partition_wgt(partition_id), level0.vwgt(i));
+      });
+
+  unsigned long long total_cut = 0;
+  Kokkos::parallel_reduce(
+      "mark_boundary_and_cut", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+      KOKKOS_LAMBDA(const int i, unsigned long long& local_cut) {
+        const unsigned partition_id = state.partition(i);
+        const unsigned edge_begin = level0.adjp(i);
+        const unsigned edge_end = level0.adjp(i + 1);
+        unsigned is_boundary = 0;
+
+        for (unsigned e = edge_begin; e < edge_end; ++e) {
+          const unsigned neighbor_raw = level0.adjncy(e);
+          if (neighbor_raw == 0 || neighbor_raw > num_vertices) {
+            continue;
+          }
+
+          const unsigned neighbor = neighbor_raw - 1;
+          if (state.partition(neighbor) != partition_id) {
+            is_boundary = 1;
+            local_cut += level0.adjwgt(e);
+          }
+        }
+
+        state.if_boundary(i) = is_boundary;
+      },
+      total_cut);
+
+  {
+    auto h_cut = Kokkos::create_mirror_view(state.cutsize);
+    h_cut(0) = static_cast<unsigned>(total_cut / 2);
+    Kokkos::deep_copy(state.cutsize, h_cut);
+  }
+
   Kokkos::fence();
 
   auto h_partition = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.partition);
+  auto h_partition_wgt = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.partition_wgt);
+  auto h_cutsize = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.cutsize);
 
   {
     std::ofstream out_part(options.out_prefix + ".out");
@@ -79,7 +124,16 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
     }
   }
 
-  std::cout << "[kokkos_port] phase-1 stub completed for " << num_vertices << " vertices\n";
+  unsigned max_partition_wgt = 0;
+  for (std::size_t p = 0; p < static_cast<std::size_t>(h_partition_wgt.extent(0)); ++p) {
+    if (h_partition_wgt(p) > max_partition_wgt) {
+      max_partition_wgt = h_partition_wgt(p);
+    }
+  }
+
+  std::cout << "[kokkos_port] phase-1 stub completed for " << num_vertices
+            << " vertices, cutsize=" << h_cutsize(0)
+            << ", max_partition_wgt=" << max_partition_wgt << "\n";
 }
 
 template void run_pipeline_stub<Kokkos::DefaultExecutionSpace>(const RunOptions& options,

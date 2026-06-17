@@ -80,6 +80,11 @@ Result: PASS (phase 1 harness and invariant checks operational)
   - `kokkos_port/src/graph_loader.cpp`
 - Updated pipeline stub to consume parsed graph data and deep-copy into Kokkos views:
   - `kokkos_port/src/pipeline_stub.cpp`
+- Added graph-derived partition accounting in Kokkos:
+  - partition weights via atomic accumulation from `vwgt`
+  - boundary flags via adjacency partition checks
+  - cutsize via edge-cut reduction (with undirected divide-by-two)
+  - implemented in `kokkos_port/src/pipeline_stub.cpp`
 - Wired loader source into Kokkos build:
   - `kokkos_port/CMakeLists.txt`
 
@@ -96,6 +101,10 @@ python3 kokkos_port/tools/check_levels_invariants.py --levels out_kokkos_stub.le
 ```
 
 Result: PASS (loader-integrated pipeline builds and runs)
+
+Latest observed pipeline output:
+
+- `[kokkos_port] phase-1 stub completed for 2897387 vertices, cutsize=20070839, max_partition_wgt=45272`
 
 ### Remaining for Phase 2
 
