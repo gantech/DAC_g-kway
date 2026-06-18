@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <cstdint>
 
 namespace gkway_kokkos {
 
@@ -26,14 +27,272 @@ struct HostCoarseGraph {
   std::vector<unsigned> vwgt;
 };
 
+struct MoveRequestHost {
+  unsigned vertex_id = 0;       // 1-based, matches CUDA mvRequest
+  unsigned source_partition = 0;
+  unsigned des_partition = 0;
+  int gain = 0;
+};
+
+struct CandidateHost {
+  unsigned target_partition = 0;
+  int gain = 0;
+  bool is_boundary = false;
+  bool movable = false;
+};
+
+std::vector<unsigned> compute_partition_weights_host(const std::vector<unsigned>& partition,
+                                                     const std::vector<unsigned>& vwgt,
+                                                     int partition_count) {
+  std::vector<unsigned> partition_wgt(static_cast<std::size_t>(partition_count), 0u);
+  for (std::size_t v = 0; v < partition.size(); ++v) {
+    partition_wgt[partition[v]] += vwgt[v];
+  }
+  return partition_wgt;
+}
+
+unsigned compute_cutsize_host(const HostCoarseGraph& graph,
+                              const std::vector<unsigned>& partition,
+                              std::vector<unsigned>* if_boundary) {
+  if (if_boundary != nullptr) {
+    if_boundary->assign(graph.vwgt.size(), 0u);
+  }
+
+  unsigned long long cut_twice = 0;
+  for (std::size_t v = 0; v < graph.vwgt.size(); ++v) {
+    const unsigned part = partition[v];
+    bool boundary = false;
+    const unsigned edge_begin = graph.adjp[v];
+    const unsigned edge_end = graph.adjp[v + 1];
+    for (unsigned e = edge_begin; e < edge_end; ++e) {
+      const unsigned neighbor_raw = graph.adjncy[e];
+      if (neighbor_raw == 0 || neighbor_raw > graph.vwgt.size()) {
+        continue;
+      }
+
+      const unsigned neighbor = neighbor_raw - 1u;
+      if (partition[neighbor] != part) {
+        boundary = true;
+        cut_twice += static_cast<unsigned long long>(graph.adjwgt[e]);
+      }
+    }
+    if (if_boundary != nullptr && boundary) {
+      (*if_boundary)[v] = 1u;
+    }
+  }
+
+  return static_cast<unsigned>(cut_twice / 2ull);
+}
+
+std::vector<CandidateHost> build_refinement_candidates_host(const HostCoarseGraph& graph,
+                                                            const std::vector<unsigned>& partition,
+                                                            const std::vector<unsigned>& partition_wgt,
+                                                            unsigned long long partition_wgt_cap,
+                                                            int partition_count) {
+  std::vector<CandidateHost> candidates(graph.vwgt.size());
+  for (std::size_t v = 0; v < graph.vwgt.size(); ++v) {
+    const unsigned vertex_partition = partition[v];
+    const unsigned edge_begin = graph.adjp[v];
+    const unsigned edge_end = graph.adjp[v + 1];
+
+    int internal_weight = 0;
+    std::unordered_map<unsigned, int> external_by_partition;
+    bool is_boundary = false;
+
+    for (unsigned e = edge_begin; e < edge_end; ++e) {
+      const unsigned neighbor_raw = graph.adjncy[e];
+      if (neighbor_raw == 0 || neighbor_raw > graph.vwgt.size()) {
+        continue;
+      }
+
+      const unsigned neighbor = neighbor_raw - 1u;
+      const unsigned neighbor_partition = partition[neighbor];
+      const int edge_wgt = static_cast<int>(graph.adjwgt[e]);
+      if (neighbor_partition == vertex_partition) {
+        internal_weight += edge_wgt;
+      } else {
+        is_boundary = true;
+        external_by_partition[neighbor_partition] += edge_wgt;
+      }
+    }
+
+    int best_gain = 0;
+    unsigned best_target = vertex_partition;
+    for (int p = 0; p < partition_count; ++p) {
+      const unsigned candidate_partition = static_cast<unsigned>(p);
+      if (candidate_partition == vertex_partition) {
+        continue;
+      }
+
+      auto it = external_by_partition.find(candidate_partition);
+      if (it == external_by_partition.end()) {
+        continue;
+      }
+
+      const int gain = it->second - internal_weight;
+      if (gain > best_gain) {
+        best_gain = gain;
+        best_target = candidate_partition;
+      }
+    }
+
+    const unsigned vertex_wgt = graph.vwgt[v];
+    const bool within_cap =
+        static_cast<unsigned long long>(partition_wgt[best_target]) + static_cast<unsigned long long>(vertex_wgt) <=
+        partition_wgt_cap;
+
+    candidates[v].target_partition = best_target;
+    candidates[v].gain = best_gain;
+    candidates[v].is_boundary = is_boundary;
+    candidates[v].movable =
+        is_boundary && (best_target != vertex_partition) && (best_gain > 0) && within_cap;
+  }
+
+  return candidates;
+}
+
+std::vector<MoveRequestHost> build_independent_move_buffer_host(const HostCoarseGraph& graph,
+                                                                const std::vector<unsigned>& partition,
+                                                                const std::vector<CandidateHost>& candidates,
+                                                                const std::vector<unsigned>& partition_wgt,
+                                                                unsigned long long partition_wgt_cap) {
+  std::vector<MoveRequestHost> buffer;
+  buffer.reserve(graph.vwgt.size());
+
+  for (std::size_t v = 0; v < graph.vwgt.size(); ++v) {
+    if (!candidates[v].movable) {
+      continue;
+    }
+
+    bool independent = true;
+    const unsigned edge_begin = graph.adjp[v];
+    const unsigned edge_end = graph.adjp[v + 1];
+    for (unsigned e = edge_begin; e < edge_end; ++e) {
+      const unsigned neighbor_raw = graph.adjncy[e];
+      if (neighbor_raw == 0 || neighbor_raw > graph.vwgt.size()) {
+        continue;
+      }
+
+      const unsigned neighbor = neighbor_raw - 1u;
+      if (!candidates[neighbor].movable) {
+        continue;
+      }
+
+      const unsigned n_target = candidates[neighbor].target_partition;
+      const unsigned n_wgt = graph.vwgt[neighbor];
+      const bool n_within_cap = static_cast<unsigned long long>(partition_wgt[n_target]) +
+                                    static_cast<unsigned long long>(n_wgt) <=
+                                partition_wgt_cap;
+      if (n_within_cap && (v + 1u) > (neighbor + 1u)) {
+        independent = false;
+        break;
+      }
+    }
+
+    if (!independent) {
+      continue;
+    }
+
+    MoveRequestHost mv;
+    mv.vertex_id = static_cast<unsigned>(v + 1u);
+    mv.source_partition = partition[v];
+    mv.des_partition = candidates[v].target_partition;
+    mv.gain = candidates[v].gain;
+    buffer.push_back(mv);
+  }
+
+  std::sort(buffer.begin(), buffer.end(), [](const MoveRequestHost& lhs, const MoveRequestHost& rhs) {
+    if (lhs.gain == rhs.gain) {
+      return lhs.vertex_id < rhs.vertex_id;
+    }
+    return lhs.gain > rhs.gain;
+  });
+
+  return buffer;
+}
+
+int find_max_balance_prefix_host(const std::vector<MoveRequestHost>& buffer,
+                                 const std::vector<unsigned>& vwgt,
+                                 const std::vector<unsigned>& partition_wgt,
+                                 unsigned long long partition_wgt_cap,
+                                 int partition_count) {
+  if (buffer.empty()) {
+    return -1;
+  }
+
+  std::vector<std::int64_t> delta(static_cast<std::size_t>(partition_count), 0);
+  int best = -1;
+  for (std::size_t i = 0; i < buffer.size(); ++i) {
+    const MoveRequestHost& mv = buffer[i];
+    const unsigned vertex_wgt = vwgt[mv.vertex_id - 1u];
+    delta[mv.source_partition] -= static_cast<std::int64_t>(vertex_wgt);
+    delta[mv.des_partition] += static_cast<std::int64_t>(vertex_wgt);
+
+    bool balance_ok = true;
+    for (int p = 0; p < partition_count; ++p) {
+      const std::uint64_t new_wgt = static_cast<std::uint64_t>(
+          static_cast<std::int64_t>(partition_wgt[static_cast<std::size_t>(p)]) + delta[static_cast<std::size_t>(p)]);
+      if (new_wgt > partition_wgt_cap) {
+        balance_ok = false;
+        break;
+      }
+    }
+
+    if (balance_ok) {
+      best = static_cast<int>(i);
+    }
+  }
+
+  return best;
+}
+
+unsigned refine_partition_host(const HostCoarseGraph& graph,
+                               std::vector<unsigned>& partition,
+                               int partition_count,
+                               unsigned long long partition_wgt_cap,
+                               int max_iterations) {
+  unsigned total_moves = 0;
+  int iteration = 0;
+
+  while (true) {
+    if (max_iterations > 0 && iteration >= max_iterations) {
+      break;
+    }
+    ++iteration;
+
+    const std::vector<unsigned> partition_wgt =
+        compute_partition_weights_host(partition, graph.vwgt, partition_count);
+    const std::vector<CandidateHost> candidates =
+        build_refinement_candidates_host(graph, partition, partition_wgt, partition_wgt_cap, partition_count);
+    std::vector<MoveRequestHost> buffer =
+        build_independent_move_buffer_host(graph, partition, candidates, partition_wgt, partition_wgt_cap);
+
+    if (buffer.empty()) {
+      break;
+    }
+
+    const int max_prefix =
+        find_max_balance_prefix_host(buffer, graph.vwgt, partition_wgt, partition_wgt_cap, partition_count);
+    if (max_prefix < 0) {
+      break;
+    }
+
+    for (int i = 0; i <= max_prefix; ++i) {
+      const MoveRequestHost& mv = buffer[static_cast<std::size_t>(i)];
+      partition[mv.vertex_id - 1u] = mv.des_partition;
+      ++total_moves;
+    }
+  }
+
+  return total_moves;
+}
+
 template <typename GraphLike>
 unsigned choose_heaviest_neighbor(const GraphLike& graph, std::size_t vertex) {
   const unsigned edge_begin = graph.adjp[vertex];
   const unsigned edge_end = graph.adjp[vertex + 1];
   const unsigned num_vertices = static_cast<unsigned>(graph.vwgt.size());
-  unsigned best_neighbor = num_vertices > 0
-                               ? std::min(static_cast<unsigned>(vertex + 1u), num_vertices - 1u)
-                               : 0u;
+  unsigned best_neighbor = static_cast<unsigned>(vertex);
   unsigned best_weight = 0;
   unsigned best_degree = 0;
 
@@ -65,12 +324,12 @@ std::vector<unsigned> build_matching_cmap(const GraphLike& graph, unsigned max_g
   const std::size_t num_vertices = graph.vwgt.size();
   const unsigned group_cap = std::max(2u, max_group_size);
   std::vector<unsigned> candidate(num_vertices, 0u);
-  std::vector<unsigned long long> group_id(num_vertices, 0ull);
+  std::vector<unsigned long long> group_key(num_vertices, 0ull);
   std::vector<unsigned> vertex_id(num_vertices, 0u);
 
   for (std::size_t vertex = 0; vertex < num_vertices; ++vertex) {
     candidate[vertex] = choose_heaviest_neighbor(graph, vertex) + 1u;
-    group_id[vertex] = (static_cast<unsigned long long>(vertex + 1u) << 32);
+    group_key[vertex] = (static_cast<unsigned long long>(vertex + 1u) << 32);
     vertex_id[vertex] = static_cast<unsigned>(vertex + 1u);
   }
 
@@ -86,82 +345,90 @@ std::vector<unsigned> build_matching_cmap(const GraphLike& graph, unsigned max_g
   unsigned iteration = 1u;
   while (group_changed) {
     group_changed = false;
+    std::vector<unsigned long long> next_group_key = group_key;
     for (std::size_t vertex = 0; vertex < num_vertices; ++vertex) {
       const unsigned partner = candidate[vertex];
       if (partner == 0u || partner > num_vertices) {
         continue;
       }
 
-      const unsigned current_group = get_first(group_id[vertex]);
-      const unsigned neighbor_group = get_first(group_id[partner - 1u]);
+      const unsigned current_group = get_first(group_key[vertex]);
+      const unsigned neighbor_group = get_first(group_key[partner - 1u]);
 
       if (current_group > neighbor_group) {
-        group_id[partner - 1u] = make_combo(current_group, iteration);
+        const unsigned prior = get_first(next_group_key[partner - 1u]);
+        if (current_group > prior) {
+          next_group_key[partner - 1u] = make_combo(current_group, iteration);
+        }
         group_changed = true;
       } else if (current_group < neighbor_group) {
-        group_id[vertex] = make_combo(neighbor_group, iteration);
+        const unsigned prior = get_first(next_group_key[vertex]);
+        if (neighbor_group > prior) {
+          next_group_key[vertex] = make_combo(neighbor_group, iteration);
+        }
         group_changed = true;
       }
     }
+
+    group_key.swap(next_group_key);
 
     ++iteration;
   }
 
-  std::vector<std::pair<unsigned, unsigned>> sorted_members;
-  sorted_members.reserve(num_vertices);
-  for (std::size_t vertex = 0; vertex < num_vertices; ++vertex) {
-    sorted_members.emplace_back(get_first(group_id[vertex]), static_cast<unsigned>(vertex + 1u));
+  // Mirror CUDA constraint_group_size + construct_cmap flow exactly.
+  std::vector<unsigned> group_head(num_vertices, 0u);
+  unsigned exclusive = 0u;
+  for (std::size_t i = 0; i < num_vertices; ++i) {
+    const unsigned is_group_head = (get_first(group_key[i]) == vertex_id[i]) ? 1u : 0u;
+    group_head[i] = exclusive;
+    exclusive += is_group_head;
   }
-  std::sort(sorted_members.begin(), sorted_members.end(), [](const auto& lhs, const auto& rhs) {
-    if (lhs.first != rhs.first) {
-      return lhs.first < rhs.first;
-    }
-    return lhs.second < rhs.second;
-  });
+  const unsigned num_coarse_vertices = exclusive;
 
-  for (std::size_t begin = 0; begin < sorted_members.size();) {
-    const unsigned root = sorted_members[begin].first;
-    std::size_t end = begin;
-    while (end < sorted_members.size() && sorted_members[end].first == root) {
-      ++end;
-    }
-
-    const std::size_t group_size = end - begin;
-    if (group_size > group_cap) {
-      for (std::size_t offset = begin; offset < end; offset += group_cap) {
-        const unsigned chunk_head = sorted_members[offset].second;
-        const std::size_t chunk_end = std::min(offset + static_cast<std::size_t>(group_cap), end);
-        for (std::size_t index = offset; index < chunk_end; ++index) {
-          group_id[sorted_members[index].second - 1u] = make_combo(chunk_head, 0u);
-        }
-      }
-    }
-
-    begin = end;
+  std::vector<std::pair<unsigned long long, unsigned>> sorted;
+  sorted.reserve(num_vertices);
+  for (std::size_t i = 0; i < num_vertices; ++i) {
+    sorted.emplace_back(group_key[i], vertex_id[i]);
   }
-
-  std::vector<std::pair<unsigned, unsigned>> heads;
-  heads.reserve(num_vertices);
-  for (std::size_t vertex = 0; vertex < num_vertices; ++vertex) {
-    if (get_first(group_id[vertex]) == vertex + 1u) {
-      heads.emplace_back(static_cast<unsigned>(vertex + 1u), static_cast<unsigned>(vertex + 1u));
-    }
-  }
-
-  std::sort(heads.begin(), heads.end(), [](const auto& lhs, const auto& rhs) {
+  std::stable_sort(sorted.begin(), sorted.end(), [](const auto& lhs, const auto& rhs) {
     return lhs.first < rhs.first;
   });
 
-  std::unordered_map<unsigned, unsigned> head_to_cmap;
-  head_to_cmap.reserve(heads.size());
-  unsigned coarse_id = 1u;
-  for (const auto& head : heads) {
-    head_to_cmap[head.first] = coarse_id++;
+  for (std::size_t i = 0; i < num_vertices; ++i) {
+    group_key[i] = sorted[i].first;
+    vertex_id[i] = sorted[i].second;
+  }
+
+  std::vector<unsigned> group_ptr(num_coarse_vertices + 1u, static_cast<unsigned>(num_vertices));
+  if (num_coarse_vertices <= num_vertices) {
+    group_ptr[num_coarse_vertices] = static_cast<unsigned>(num_vertices);
+  }
+
+  for (std::size_t gid = 0; gid < num_vertices; ++gid) {
+    const unsigned root = get_first(group_key[gid]);
+    if (root == vertex_id[gid]) {
+      const unsigned new_idx = group_head[root - 1u];
+      group_ptr[new_idx] = static_cast<unsigned>(gid);
+    }
+  }
+
+  for (std::size_t gid = 0; gid < num_vertices; ++gid) {
+    const unsigned root = get_first(group_key[gid]);
+    const unsigned group_idx = group_head[root - 1u];
+    const unsigned left_in_group = static_cast<unsigned>(gid) - group_ptr[group_idx];
+    const unsigned subgroup_id = left_in_group / group_cap;
+    const unsigned subgroup_head_pos = group_ptr[group_idx] + subgroup_id * group_cap;
+    const unsigned subgroup_head_vertex = vertex_id[subgroup_head_pos];
+    group_key[gid] = make_combo(subgroup_head_vertex, 0u);
   }
 
   std::vector<unsigned> cmap(num_vertices, 0u);
-  for (std::size_t vertex = 0; vertex < num_vertices; ++vertex) {
-    cmap[vertex] = head_to_cmap[get_first(group_id[vertex])];
+  unsigned inclusive = 0u;
+  for (std::size_t gid = 0; gid < num_vertices; ++gid) {
+    if (get_first(group_key[gid]) == vertex_id[gid]) {
+      ++inclusive;
+    }
+    cmap[vertex_id[gid] - 1u] = inclusive;
   }
 
   return cmap;
@@ -272,19 +539,32 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
   coarse_graph.adjncy = host_graph.adjncy;
   coarse_graph.adjwgt = host_graph.adjwgt;
   coarse_graph.vwgt = host_graph.vwgt;
+  std::vector<HostCoarseGraph> level_graphs;
+  level_graphs.push_back(coarse_graph);
 
   const unsigned partition_count_u = config.num_partitions > 0 ? static_cast<unsigned>(config.num_partitions) : 1u;
   const unsigned coarsen_threshold = std::max(2u, 20u * partition_count_u);
 
   while (coarse_graph.vwgt.size() > coarsen_threshold) {
+    const std::size_t fine_vertices = coarse_graph.vwgt.size();
+    const std::size_t fine_edges = coarse_graph.adjncy.size();
     const std::vector<unsigned> cmap = build_matching_cmap(coarse_graph, config.max_coarsen_group);
     HostCoarseGraph next_graph = build_coarse_graph(coarse_graph, cmap);
+    const auto max_cmap_it = std::max_element(cmap.begin(), cmap.end());
+    const unsigned reported_coarse_vertices =
+        (max_cmap_it != cmap.end()) ? *max_cmap_it : 0u;
+    std::cout << "[kokkos_port][coarsen] fine_vertices=" << fine_vertices
+              << ", fine_edges=" << fine_edges
+              << ", coarse_vertices=" << next_graph.vwgt.size()
+              << ", coarse_edges=" << next_graph.adjncy.size()
+              << ", cmap_max=" << reported_coarse_vertices << "\n";
     if (next_graph.vwgt.size() == coarse_graph.vwgt.size() ||
         next_graph.vwgt.size() < static_cast<std::size_t>(partition_count_u + 1u)) {
       break;
     }
 
     level_cmaps.push_back(std::move(cmap));
+    level_graphs.push_back(next_graph);
     coarse_graph = std::move(next_graph);
   }
 
@@ -383,13 +663,14 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
     total_coarse_wgt = 1;
   }
 
-  const unsigned long long ideal_partition_wgt =
+    const unsigned long long ideal_partition_wgt =
       (total_coarse_wgt + static_cast<unsigned long long>(partition_count) - 1ull) /
       static_cast<unsigned long long>(partition_count);
   const unsigned long long partition_wgt_cap =
       (config.max_partition_wgt > 0.0f)
           ? static_cast<unsigned long long>(config.max_partition_wgt)
-          : (ideal_partition_wgt + (ideal_partition_wgt / 20ull) + 1ull);
+        : static_cast<unsigned long long>(
+          (static_cast<double>(total_coarse_wgt) / static_cast<double>(partition_count)) * 1.03 + 1.0);
 
   view_u coarse_adjp("coarse_adjp", coarse_graph.adjp.size());
   view_u coarse_adjncy("coarse_adjncy", coarse_graph.adjncy.size());
@@ -461,152 +742,62 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
   for (std::size_t i = 0; i < num_coarse_vertices; ++i) {
     projected_partition[i] = h_metis_partition(i);
   }
+
+  std::vector<unsigned> pre_refine_partition;
+  std::vector<unsigned> last_pass_moves_per_level;
+  unsigned long long proposed_moves = 0;
+  int executed_refinement_passes = 0;
+  const int refinement_pass_limit = options.refinement_passes;
+
   for (std::size_t level = level_cmaps.size(); level > 0; --level) {
-    const std::vector<unsigned>& cmap = level_cmaps[level - 1];
+    const std::vector<unsigned>& cmap = level_cmaps[level - 1u];
     std::vector<unsigned> finer_partition(cmap.size());
     for (std::size_t vertex = 0; vertex < cmap.size(); ++vertex) {
       finer_partition[vertex] = projected_partition[cmap[vertex] - 1u];
     }
+
+    if (level == 1u) {
+      pre_refine_partition = finer_partition;
+    }
+
+    const HostCoarseGraph& finer_graph = level_graphs[level - 1u];
+    const unsigned moves_this_level =
+        refine_partition_host(finer_graph, finer_partition, partition_count, partition_wgt_cap, refinement_pass_limit);
+    proposed_moves += static_cast<unsigned long long>(moves_this_level);
+    last_pass_moves_per_level.push_back(moves_this_level);
+    if (moves_this_level > 0) {
+      ++executed_refinement_passes;
+    }
+
     projected_partition = std::move(finer_partition);
   }
 
-  Kokkos::View<unsigned*, Kokkos::HostSpace> h_projected_partition(projected_partition.data(), projected_partition.size());
-  Kokkos::deep_copy(state.partition, h_projected_partition);
-  Kokkos::deep_copy(state.partition_wgt, 0u);
-
-  auto pre_refine_partition = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.partition);
-  write_outputs(options.out_prefix + ".pre_refine", pre_refine_partition);
-
-  unsigned long long proposed_moves = 0;
-  unsigned long long last_pass_moves = 0;
-  int executed_refinement_passes = 0;
-  const int refinement_passes = options.refinement_passes > 0 ? options.refinement_passes : 1;
-  for (int pass = 0; pass < refinement_passes; ++pass) {
-    executed_refinement_passes = pass + 1;
-    Kokkos::deep_copy(state.partition_wgt, 0u);
-    Kokkos::parallel_for(
-        "recompute_partition_weights_pass", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
-        KOKKOS_LAMBDA(const int i) {
-          const unsigned partition_id = state.partition(i);
-          Kokkos::atomic_add(&state.partition_wgt(partition_id), level0.vwgt(i));
-        });
-
-    Kokkos::parallel_for(
-        "compute_refinement_candidates", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
-        KOKKOS_LAMBDA(const int i) {
-          const unsigned partition_id = state.partition(i);
-          const unsigned edge_begin = level0.adjp(i);
-          const unsigned edge_end = level0.adjp(i + 1);
-
-          int internal_weight = 0;
-          int external_weight = 0;
-          unsigned selected_target = partition_id;
-          int best_target_weight = -1;
-
-          for (unsigned e = edge_begin; e < edge_end; ++e) {
-            const unsigned neighbor_raw = level0.adjncy(e);
-            if (neighbor_raw == 0 || neighbor_raw > num_vertices) {
-              continue;
-            }
-
-            const unsigned neighbor = neighbor_raw - 1;
-            const unsigned edge_weight = level0.adjwgt(e);
-            const unsigned neighbor_partition = state.partition(neighbor);
-            if (neighbor_partition == partition_id) {
-              internal_weight += static_cast<int>(edge_weight);
-              continue;
-            }
-
-            external_weight += static_cast<int>(edge_weight);
-            if (static_cast<int>(edge_weight) > best_target_weight) {
-              best_target_weight = static_cast<int>(edge_weight);
-              selected_target = neighbor_partition;
-            }
-          }
-
-          refine.gain(i) = external_weight - internal_weight;
-          refine.target_partition(i) = selected_target;
-          if ((selected_target != partition_id) && (refine.gain(i) > 0)) {
-            const unsigned vertex_wgt = level0.vwgt(i);
-            const unsigned target_wgt = state.partition_wgt(selected_target);
-            const bool parity_selected = (((static_cast<unsigned>(i) + static_cast<unsigned>(pass)) & 1u) == 0u);
-            const bool within_cap =
-                static_cast<unsigned long long>(target_wgt) + static_cast<unsigned long long>(vertex_wgt) <=
-                partition_wgt_cap;
-            refine.move_flag(i) = (parity_selected && within_cap) ? 1u : 0u;
-          } else {
-            refine.move_flag(i) = 0u;
-          }
-        });
-
-    unsigned long long pass_moves = 0;
-    Kokkos::parallel_reduce(
-        "count_proposed_moves", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
-        KOKKOS_LAMBDA(const int i, unsigned long long& local_count) {
-          local_count += static_cast<unsigned long long>(refine.move_flag(i));
-        },
-        pass_moves);
-
-    last_pass_moves = pass_moves;
-    proposed_moves += pass_moves;
-    if (pass_moves == 0) {
-      break;
-    }
-
-    Kokkos::parallel_for(
-        "apply_refinement_moves", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
-        KOKKOS_LAMBDA(const int i) {
-          if (refine.move_flag(i) != 0u) {
-            state.partition(i) = refine.target_partition(i);
-          }
-        });
+  if (pre_refine_partition.empty()) {
+    pre_refine_partition = projected_partition;
   }
 
-  Kokkos::deep_copy(state.partition_wgt, 0u);
-  Kokkos::parallel_for(
-      "recompute_partition_weights", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
-      KOKKOS_LAMBDA(const int i) {
-        const unsigned partition_id = state.partition(i);
-        Kokkos::atomic_add(&state.partition_wgt(partition_id), level0.vwgt(i));
-      });
+  Kokkos::View<unsigned*, Kokkos::HostSpace> h_pre_refine_partition(pre_refine_partition.data(), pre_refine_partition.size());
+  write_outputs(options.out_prefix + ".pre_refine", h_pre_refine_partition);
 
-  unsigned long long total_cut = 0;
-  Kokkos::parallel_reduce(
-      "mark_boundary_and_cut", Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
-      KOKKOS_LAMBDA(const int i, unsigned long long& local_cut) {
-        const unsigned partition_id = state.partition(i);
-        const unsigned edge_begin = level0.adjp(i);
-        const unsigned edge_end = level0.adjp(i + 1);
-        unsigned is_boundary = 0;
+  std::vector<unsigned> final_partition_wgt =
+      compute_partition_weights_host(projected_partition, host_graph.vwgt, partition_count);
+  std::vector<unsigned> if_boundary_host;
+  const unsigned final_cutsize = compute_cutsize_host(level_graphs.front(), projected_partition, &if_boundary_host);
 
-        for (unsigned e = edge_begin; e < edge_end; ++e) {
-          const unsigned neighbor_raw = level0.adjncy(e);
-          if (neighbor_raw == 0 || neighbor_raw > num_vertices) {
-            continue;
-          }
-
-          const unsigned neighbor = neighbor_raw - 1;
-          if (state.partition(neighbor) != partition_id) {
-            is_boundary = 1;
-            local_cut += level0.adjwgt(e);
-          }
-        }
-
-        state.if_boundary(i) = is_boundary;
-      },
-      total_cut);
-
-  {
-    auto h_cut = Kokkos::create_mirror_view(state.cutsize);
-    h_cut(0) = static_cast<unsigned>(total_cut / 2);
-    Kokkos::deep_copy(state.cutsize, h_cut);
+  auto h_final_partition = Kokkos::create_mirror_view(state.partition);
+  auto h_final_partition_wgt = Kokkos::create_mirror_view(state.partition_wgt);
+  auto h_cutsize = Kokkos::create_mirror_view(state.cutsize);
+  for (std::size_t i = 0; i < projected_partition.size(); ++i) {
+    h_final_partition(i) = projected_partition[i];
   }
+  for (std::size_t p = 0; p < final_partition_wgt.size(); ++p) {
+    h_final_partition_wgt(p) = final_partition_wgt[p];
+  }
+  h_cutsize(0) = final_cutsize;
 
-  Kokkos::fence();
-
-  auto h_final_partition = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.partition);
-  auto h_final_partition_wgt = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.partition_wgt);
-  auto h_cutsize = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state.cutsize);
+  Kokkos::deep_copy(state.partition, h_final_partition);
+  Kokkos::deep_copy(state.partition_wgt, h_final_partition_wgt);
+  Kokkos::deep_copy(state.cutsize, h_cutsize);
 
   write_outputs(options.out_prefix, h_final_partition);
   write_outputs(options.out_prefix + ".post_refine", h_final_partition);
@@ -631,9 +822,10 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
             << " vertices, cutsize=" << h_cutsize(0)
             << ", max_partition_wgt=" << max_partition_wgt
             << ", proposed_moves=" << proposed_moves
-            << ", refinement_passes=" << refinement_passes
+            << ", refinement_passes=" << refinement_pass_limit
             << ", executed_refinement_passes=" << executed_refinement_passes
-            << ", last_pass_moves=" << last_pass_moves
+            << ", last_pass_moves="
+            << (last_pass_moves_per_level.empty() ? 0ull : static_cast<unsigned long long>(last_pass_moves_per_level.back()))
             << ", min_partition_wgt=" << min_partition_wgt
             << ", avg_partition_wgt=" << avg_partition_wgt
             << ", partition_wgt_cap=" << partition_wgt_cap << "\n";

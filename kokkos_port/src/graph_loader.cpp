@@ -34,7 +34,8 @@ HostGraph load_graph_from_metis_like(const std::string& input_path) {
     graph.adjwgt.reserve(graph.num_edges);
     graph.vwgt.assign(graph.num_vertices, 1);
 
-    const bool weighted_edges = (format == 1 || format == 11 || format == 10);
+    // Match CUDA parser semantics exactly: only format 11 means edge weights.
+    const bool weighted_edges = (format == 11);
 
     std::size_t vertex_idx = 0;
     std::size_t edge_count = 0;
