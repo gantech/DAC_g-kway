@@ -4,6 +4,7 @@
 #include "metis/metis.h"
 
 #include <Kokkos_Core.hpp>
+#include <Kokkos_Sort.hpp>
 
 #include <array>
 #include <cstdlib>
@@ -29,6 +30,13 @@ struct HostCoarseGraph {
 
 struct MoveRequestHost {
   unsigned vertex_id = 0;       // 1-based, matches CUDA mvRequest
+  unsigned source_partition = 0;
+  unsigned des_partition = 0;
+  int gain = 0;
+};
+
+struct MoveRequestDevice {
+  unsigned vertex_id = 0;
   unsigned source_partition = 0;
   unsigned des_partition = 0;
   int gain = 0;
@@ -155,6 +163,290 @@ std::vector<CandidateHost> build_refinement_candidates_host(const HostCoarseGrap
   return candidates;
 }
 
+template <typename ExecSpace>
+void build_refinement_candidates_device(
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& adjp,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& adjncy,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& adjwgt,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& vwgt,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& partition,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& partition_wgt,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& if_updated,
+    unsigned long long partition_wgt_cap,
+    int partition_count,
+    Kokkos::View<unsigned*, typename ExecSpace::memory_space>& target_partition,
+    Kokkos::View<int*, typename ExecSpace::memory_space>& gain,
+    Kokkos::View<unsigned*, typename ExecSpace::memory_space>& is_boundary,
+    Kokkos::View<unsigned*, typename ExecSpace::memory_space>& movable,
+    Kokkos::View<int*, typename ExecSpace::memory_space>& external_weights) {
+  const std::size_t num_vertices = vwgt.extent(0);
+  Kokkos::parallel_for(
+      "build_refinement_candidates_device",
+      Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+      KOKKOS_LAMBDA(const int v) {
+        if (if_updated(v) == 0u) {
+          return;
+        }
+        if_updated(v) = 0u;
+
+        const std::size_t row_base = static_cast<std::size_t>(v) * static_cast<std::size_t>(partition_count);
+        for (int p = 0; p < partition_count; ++p) {
+          external_weights(row_base + static_cast<std::size_t>(p)) = 0;
+        }
+
+        const unsigned vertex_partition = partition(v);
+        const unsigned edge_begin = adjp(v);
+        const unsigned edge_end = adjp(v + 1);
+
+        int internal_weight = 0;
+        bool boundary = false;
+        for (unsigned e = edge_begin; e < edge_end; ++e) {
+          const unsigned neighbor_raw = adjncy(e);
+          if (neighbor_raw == 0 || neighbor_raw > num_vertices) {
+            continue;
+          }
+
+          const unsigned neighbor = neighbor_raw - 1u;
+          const unsigned neighbor_partition = partition(neighbor);
+          const int edge_wgt = static_cast<int>(adjwgt(e));
+          if (neighbor_partition == vertex_partition) {
+            internal_weight += edge_wgt;
+          } else {
+            boundary = true;
+            external_weights(row_base + static_cast<std::size_t>(neighbor_partition)) += edge_wgt;
+          }
+        }
+
+        std::uint32_t best_gain_u = 0u;
+        int best_gain = 0;
+        unsigned best_target = vertex_partition;
+        for (int p = 0; p < partition_count; ++p) {
+          const unsigned candidate_partition = static_cast<unsigned>(p);
+          if (candidate_partition == vertex_partition) {
+            continue;
+          }
+
+          const int external_weight = external_weights(row_base + static_cast<std::size_t>(p));
+          if (external_weight == 0) {
+            continue;
+          }
+
+          const std::uint32_t gain_u = static_cast<std::uint32_t>(external_weight) -
+                                       static_cast<std::uint32_t>(internal_weight);
+          if (gain_u > best_gain_u) {
+            best_gain_u = gain_u;
+            best_gain = static_cast<int>(gain_u);
+            best_target = candidate_partition;
+          }
+        }
+
+        const unsigned vertex_wgt = vwgt(v);
+        const bool within_cap = static_cast<unsigned long long>(partition_wgt(best_target)) +
+                                    static_cast<unsigned long long>(vertex_wgt) <=
+                                partition_wgt_cap;
+
+        target_partition(v) = best_target;
+        gain(v) = best_gain;
+        is_boundary(v) = boundary ? 1u : 0u;
+        movable(v) = (boundary && best_target != vertex_partition && best_gain > 0 && within_cap) ? 1u : 0u;
+      });
+  ExecSpace().fence();
+}
+
+template <typename ExecSpace>
+int find_balance_prefix_device(
+    const Kokkos::View<MoveRequestDevice*, typename ExecSpace::memory_space>& buffer,
+    std::size_t buffer_size,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& vwgt,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& partition_wgt,
+    unsigned long long partition_wgt_cap,
+    int partition_count,
+    Kokkos::View<int*, typename ExecSpace::memory_space>& delta,
+    Kokkos::View<unsigned*, typename ExecSpace::memory_space>& balance_sequence,
+    Kokkos::View<int*, typename ExecSpace::memory_space>& op_result) {
+  Kokkos::deep_copy(delta, 0);
+  Kokkos::deep_copy(balance_sequence, 0u);
+  Kokkos::deep_copy(op_result, -1);
+
+  const std::size_t prefix_limit = buffer_size;
+  Kokkos::parallel_for(
+      "find_mv_wgt_sequence_device",
+      Kokkos::RangePolicy<ExecSpace>(0, partition_count),
+      KOKKOS_LAMBDA(const int p) {
+        int running = 0;
+        for (std::size_t i = 0; i < prefix_limit; ++i) {
+          const MoveRequestDevice mv = buffer(i);
+          const unsigned vertex_wgt = vwgt(mv.vertex_id - 1u);
+          if (static_cast<int>(mv.source_partition) == p) {
+            running -= static_cast<int>(vertex_wgt);
+          }
+          if (static_cast<int>(mv.des_partition) == p) {
+            running += static_cast<int>(vertex_wgt);
+          }
+          delta(static_cast<std::size_t>(p) * prefix_limit + i) = running;
+        }
+      });
+
+  Kokkos::parallel_for(
+      "find_balance_sequence_device",
+      Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(prefix_limit)),
+      KOKKOS_LAMBDA(const int gid) {
+        int if_balance = 1;
+        for (int p = 0; p < partition_count; ++p) {
+          const int delta_partition_wgt = delta(static_cast<std::size_t>(p) * prefix_limit + static_cast<std::size_t>(gid));
+          if (delta_partition_wgt > 0) {
+            const unsigned new_partition_wgt =
+                partition_wgt(static_cast<std::size_t>(p)) + static_cast<unsigned>(delta_partition_wgt);
+            if (new_partition_wgt > partition_wgt_cap) {
+              if_balance = 0;
+            }
+          }
+        }
+        balance_sequence(gid) = static_cast<unsigned>(if_balance);
+        if (if_balance == 1) {
+          Kokkos::atomic_fetch_max(&op_result(0), gid);
+        }
+      });
+
+  ExecSpace().fence();
+
+  const auto h_op_result = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), op_result);
+  return h_op_result(0);
+}
+
+template <typename ExecSpace>
+void apply_move_prefix_device(
+    const Kokkos::View<MoveRequestDevice*, typename ExecSpace::memory_space>& buffer,
+    std::size_t buffer_size,
+    int pos,
+    Kokkos::View<int*, typename ExecSpace::memory_space>& delta,
+    Kokkos::View<unsigned*, typename ExecSpace::memory_space>& partition,
+    Kokkos::View<unsigned*, typename ExecSpace::memory_space>& partition_wgt,
+    Kokkos::View<unsigned*, typename ExecSpace::memory_space>& if_updated,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& adjp,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& adjncy,
+    Kokkos::View<unsigned*, typename ExecSpace::memory_space>& cutsize) {
+  Kokkos::parallel_for(
+      "apply_partition_weight_prefix",
+      Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(partition_wgt.extent(0))),
+      KOKKOS_LAMBDA(const int p) {
+        const int delta_partition_wgt = delta(static_cast<std::size_t>(p) * buffer_size + static_cast<std::size_t>(pos));
+        partition_wgt(p) += delta_partition_wgt;
+      });
+
+  Kokkos::parallel_for(
+      "apply_sequence_move_device",
+      Kokkos::RangePolicy<ExecSpace>(0, pos + 1),
+      KOKKOS_LAMBDA(const int gid) {
+        const MoveRequestDevice mv = buffer(static_cast<std::size_t>(gid));
+        const unsigned vertex = mv.vertex_id - 1u;
+        partition(vertex) = mv.des_partition;
+        if_updated(vertex) = 1u;
+        Kokkos::atomic_fetch_sub(&cutsize(0), static_cast<unsigned>(mv.gain));
+
+        const unsigned start = adjp(vertex);
+        const unsigned end = adjp(vertex + 1u);
+        for (unsigned e = start; e < end; ++e) {
+          const unsigned neighbor_raw = adjncy(e);
+          if (neighbor_raw == 0u) {
+            continue;
+          }
+          if_updated(neighbor_raw - 1u) = 1u;
+        }
+      });
+}
+
+template <typename ExecSpace>
+std::size_t build_independent_move_buffer_device(
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& adjp,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& adjncy,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& vwgt,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& partition,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& partition_wgt,
+    unsigned long long partition_wgt_cap,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& target_partition,
+    const Kokkos::View<int*, typename ExecSpace::memory_space>& gain,
+    Kokkos::View<MoveRequestDevice*, typename ExecSpace::memory_space>& buffer,
+    Kokkos::View<unsigned long long*, typename ExecSpace::memory_space>& sort_keys,
+    Kokkos::View<unsigned*, typename ExecSpace::memory_space>& sort_indices,
+    Kokkos::View<MoveRequestDevice*, typename ExecSpace::memory_space>& sorted_buffer) {
+  using memory_space = typename ExecSpace::memory_space;
+  Kokkos::View<unsigned*, memory_space> buffer_size("refine_buffer_size", 1);
+  Kokkos::deep_copy(buffer_size, 0u);
+  Kokkos::deep_copy(sort_keys, std::numeric_limits<unsigned long long>::max());
+
+  const std::size_t num_vertices = vwgt.extent(0);
+  Kokkos::parallel_for(
+      "build_independent_move_buffer_device",
+      Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
+      KOKKOS_LAMBDA(const int v) {
+        const unsigned vertex_partition = partition(v);
+        const unsigned vertex_wgt = vwgt(v);
+        const unsigned current_target = target_partition(v);
+        const int current_gain = gain(v);
+        const bool within_cap = static_cast<unsigned long long>(partition_wgt(current_target)) +
+                                    static_cast<unsigned long long>(vertex_wgt) <=
+                                partition_wgt_cap;
+        if (current_target == vertex_partition || current_gain <= 0 || !within_cap) {
+          return;
+        }
+
+        bool independent = true;
+        const unsigned edge_begin = adjp(v);
+        const unsigned edge_end = adjp(v + 1);
+        for (unsigned e = edge_begin; e < edge_end; ++e) {
+          const unsigned neighbor_raw = adjncy(e);
+          if (neighbor_raw == 0 || neighbor_raw > num_vertices) {
+            continue;
+          }
+
+          const unsigned neighbor = neighbor_raw - 1u;
+          const unsigned neighbor_partition = partition(neighbor);
+          const unsigned neighbor_target = target_partition(neighbor);
+          const int neighbor_gain = gain(neighbor);
+          const unsigned neighbor_wgt = vwgt(neighbor);
+          const bool neighbor_within_cap = static_cast<unsigned long long>(partition_wgt(neighbor_target)) +
+                                               static_cast<unsigned long long>(neighbor_wgt) <=
+                                           partition_wgt_cap;
+          if (neighbor_target == neighbor_partition || neighbor_gain <= 0 || !neighbor_within_cap) {
+            continue;
+          }
+          if (neighbor_within_cap && (v + 1) > static_cast<int>(neighbor + 1u)) {
+            independent = false;
+            break;
+          }
+        }
+
+        if (!independent) {
+          return;
+        }
+
+        const unsigned pos = Kokkos::atomic_fetch_add(&buffer_size(0), 1u);
+        const unsigned vertex_id = static_cast<unsigned>(v + 1u);
+        buffer(pos) = MoveRequestDevice{vertex_id, partition(v), target_partition(v), gain(v)};
+        const std::uint32_t gain_u = static_cast<std::uint32_t>(gain(v));
+        sort_keys(pos) = (static_cast<unsigned long long>(std::numeric_limits<std::uint32_t>::max() - gain_u) << 32) |
+                         static_cast<unsigned long long>(vertex_id);
+        sort_indices(pos) = pos;
+      });
+  ExecSpace().fence();
+
+  const auto h_buffer_size = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), buffer_size);
+  const std::size_t current_size = static_cast<std::size_t>(h_buffer_size(0));
+  if (current_size > 1u) {
+    Kokkos::Experimental::sort_by_key(ExecSpace{}, sort_keys, sort_indices);
+    Kokkos::parallel_for(
+        "permute_sorted_move_buffer",
+        Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(current_size)),
+        KOKKOS_LAMBDA(const int i) { sorted_buffer(i) = buffer(sort_indices(i)); });
+    ExecSpace().fence();
+  } else if (current_size == 1u) {
+    Kokkos::deep_copy(sorted_buffer, buffer);
+  }
+
+  return current_size;
+}
+
 std::vector<MoveRequestHost> build_independent_move_buffer_host(const HostCoarseGraph& graph,
                                                                 const std::vector<unsigned>& partition,
                                                                 const std::vector<CandidateHost>& candidates,
@@ -264,38 +556,151 @@ unsigned refine_partition_host(const HostCoarseGraph& graph,
   unsigned total_moves = 0;
   int iteration = 0;
 
+  using memory_space = typename Kokkos::DefaultExecutionSpace::memory_space;
+  using view_u = Kokkos::View<unsigned*, memory_space>;
+  using view_i = Kokkos::View<int*, memory_space>;
+  using view_key = Kokkos::View<unsigned long long*, memory_space>;
+  using view_move = Kokkos::View<MoveRequestDevice*, memory_space>;
+
+  const std::size_t num_vertices = graph.vwgt.size();
+  const std::size_t partition_slots = static_cast<std::size_t>(std::max(1, partition_count));
+
+  view_u d_adjp("refine_adjp", graph.adjp.size());
+  view_u d_adjncy("refine_adjncy", graph.adjncy.size());
+  view_u d_adjwgt("refine_adjwgt", graph.adjwgt.size());
+  view_u d_vwgt("refine_vwgt", graph.vwgt.size());
+
+  {
+    Kokkos::View<unsigned*, Kokkos::HostSpace> h_adjp("h_adjp", graph.adjp.size());
+    Kokkos::View<unsigned*, Kokkos::HostSpace> h_adjncy("h_adjncy", graph.adjncy.size());
+    Kokkos::View<unsigned*, Kokkos::HostSpace> h_adjwgt("h_adjwgt", graph.adjwgt.size());
+    Kokkos::View<unsigned*, Kokkos::HostSpace> h_vwgt("h_vwgt", graph.vwgt.size());
+    for (std::size_t i = 0; i < graph.adjp.size(); ++i) {
+      h_adjp(i) = graph.adjp[i];
+    }
+    for (std::size_t i = 0; i < graph.adjncy.size(); ++i) {
+      h_adjncy(i) = graph.adjncy[i];
+    }
+    for (std::size_t i = 0; i < graph.adjwgt.size(); ++i) {
+      h_adjwgt(i) = graph.adjwgt[i];
+    }
+    for (std::size_t i = 0; i < graph.vwgt.size(); ++i) {
+      h_vwgt(i) = graph.vwgt[i];
+    }
+    Kokkos::deep_copy(d_adjp, h_adjp);
+    Kokkos::deep_copy(d_adjncy, h_adjncy);
+    Kokkos::deep_copy(d_adjwgt, h_adjwgt);
+    Kokkos::deep_copy(d_vwgt, h_vwgt);
+  }
+
+  view_u d_partition("refine_partition", num_vertices);
+  view_u d_partition_wgt("refine_partition_wgt", partition_slots);
+  view_u d_target_partition("refine_target_partition", num_vertices);
+  view_i d_gain("refine_gain", num_vertices);
+  view_u d_is_boundary("refine_is_boundary", num_vertices);
+  view_u d_movable("refine_movable", num_vertices);
+  view_u d_if_updated("refine_if_updated", num_vertices);
+  view_i d_external_weights("refine_external_weights", num_vertices * partition_slots);
+  view_move d_buffer("refine_buffer", num_vertices);
+  view_key d_sort_keys("refine_sort_keys", num_vertices);
+  view_u d_sort_indices("refine_sort_indices", num_vertices);
+  view_move d_sorted_buffer("refine_sorted_buffer", num_vertices);
+  view_i d_delta("refine_delta", partition_slots * 1024u);
+  view_u d_balance_sequence("refine_balance_sequence", num_vertices);
+  view_i d_op_result("refine_op_result", 1);
+  view_u d_cutsize("refine_cutsize", 1);
+
+  Kokkos::View<unsigned*, Kokkos::HostSpace> h_partition("h_partition", num_vertices);
+  Kokkos::View<unsigned*, Kokkos::HostSpace> h_partition_wgt("h_partition_wgt", partition_slots);
+
+  Kokkos::deep_copy(d_cutsize, 0u);
+  Kokkos::deep_copy(d_if_updated, 1u);
+
+  for (std::size_t i = 0; i < num_vertices; ++i) {
+    h_partition(i) = partition[i];
+  }
+  Kokkos::deep_copy(d_partition, h_partition);
+
+  const std::vector<unsigned> initial_partition_wgt =
+      compute_partition_weights_host(partition, graph.vwgt, partition_count);
+  for (std::size_t p = 0; p < partition_slots; ++p) {
+    h_partition_wgt(p) = initial_partition_wgt[p];
+  }
+  Kokkos::deep_copy(d_partition_wgt, h_partition_wgt);
+
   while (true) {
     if (max_iterations > 0 && iteration >= max_iterations) {
       break;
     }
     ++iteration;
 
-    const std::vector<unsigned> partition_wgt =
-        compute_partition_weights_host(partition, graph.vwgt, partition_count);
-    const std::vector<CandidateHost> candidates =
-        build_refinement_candidates_host(graph, partition, partition_wgt, partition_wgt_cap, partition_count);
-    std::vector<MoveRequestHost> buffer =
-        build_independent_move_buffer_host(graph, partition, candidates, partition_wgt, partition_wgt_cap);
+    build_refinement_candidates_device<Kokkos::DefaultExecutionSpace>(
+        d_adjp,
+        d_adjncy,
+        d_adjwgt,
+        d_vwgt,
+        d_partition,
+        d_partition_wgt,
+        d_if_updated,
+        partition_wgt_cap,
+        partition_count,
+        d_target_partition,
+        d_gain,
+        d_is_boundary,
+        d_movable,
+        d_external_weights);
 
-    if (buffer.empty()) {
+    const std::size_t buffer_size = build_independent_move_buffer_device<Kokkos::DefaultExecutionSpace>(
+        d_adjp,
+        d_adjncy,
+        d_vwgt,
+        d_partition,
+        d_partition_wgt,
+        partition_wgt_cap,
+        d_target_partition,
+        d_gain,
+        d_buffer,
+        d_sort_keys,
+        d_sort_indices,
+        d_sorted_buffer);
+
+    if (buffer_size == 0u) {
       break;
     }
 
-    if (buffer.size() > 1024u) {
-      buffer.resize(1024u);
-    }
-
-    const int max_prefix =
-        find_max_balance_prefix_host(buffer, graph.vwgt, partition_wgt, partition_wgt_cap, partition_count);
-    if (max_prefix < 0 || max_prefix >= static_cast<int>(buffer.size())) {
+    const std::size_t buffer_limit = std::min<std::size_t>(buffer_size, 1024u);
+    const int max_prefix = find_balance_prefix_device<Kokkos::DefaultExecutionSpace>(
+        d_sorted_buffer,
+        buffer_limit,
+        d_vwgt,
+        d_partition_wgt,
+        partition_wgt_cap,
+        partition_count,
+        d_delta,
+        d_balance_sequence,
+        d_op_result);
+    if (max_prefix < 0 || max_prefix >= static_cast<int>(buffer_limit)) {
       break;
     }
 
-    for (int i = 0; i <= max_prefix; ++i) {
-      const MoveRequestHost& mv = buffer[static_cast<std::size_t>(i)];
-      partition[mv.vertex_id - 1u] = mv.des_partition;
-      ++total_moves;
-    }
+    apply_move_prefix_device<Kokkos::DefaultExecutionSpace>(
+        d_sorted_buffer,
+        buffer_limit,
+        max_prefix,
+        d_delta,
+        d_partition,
+        d_partition_wgt,
+        d_if_updated,
+        d_adjp,
+        d_adjncy,
+        d_cutsize);
+
+    total_moves += static_cast<unsigned>(max_prefix + 1);
+  }
+
+  Kokkos::deep_copy(h_partition, d_partition);
+  for (std::size_t i = 0; i < num_vertices; ++i) {
+    partition[i] = h_partition(i);
   }
 
   return total_moves;
