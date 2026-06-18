@@ -178,7 +178,7 @@ void build_refinement_candidates_device(
     Kokkos::View<int*, typename ExecSpace::memory_space>& gain,
     Kokkos::View<unsigned*, typename ExecSpace::memory_space>& is_boundary,
     Kokkos::View<unsigned*, typename ExecSpace::memory_space>& movable,
-    Kokkos::View<int*, typename ExecSpace::memory_space>& external_weights) {
+    Kokkos::View<unsigned*, typename ExecSpace::memory_space>& external_weights) {
   const std::size_t num_vertices = vwgt.extent(0);
   Kokkos::parallel_for(
       "build_refinement_candidates_device",
@@ -198,7 +198,7 @@ void build_refinement_candidates_device(
         const unsigned edge_begin = adjp(v);
         const unsigned edge_end = adjp(v + 1);
 
-        int internal_weight = 0;
+        unsigned internal_weight = 0u;
         bool boundary = false;
         for (unsigned e = edge_begin; e < edge_end; ++e) {
           const unsigned neighbor_raw = adjncy(e);
@@ -208,7 +208,7 @@ void build_refinement_candidates_device(
 
           const unsigned neighbor = neighbor_raw - 1u;
           const unsigned neighbor_partition = partition(neighbor);
-          const int edge_wgt = static_cast<int>(adjwgt(e));
+          const unsigned edge_wgt = adjwgt(e);
           if (neighbor_partition == vertex_partition) {
             internal_weight += edge_wgt;
           } else {
@@ -226,13 +226,12 @@ void build_refinement_candidates_device(
             continue;
           }
 
-          const int external_weight = external_weights(row_base + static_cast<std::size_t>(p));
-          if (external_weight == 0) {
+          const unsigned external_weight = external_weights(row_base + static_cast<std::size_t>(p));
+          if (external_weight == 0u) {
             continue;
           }
 
-          const std::uint32_t gain_u = static_cast<std::uint32_t>(external_weight) -
-                                       static_cast<std::uint32_t>(internal_weight);
+          const std::uint32_t gain_u = static_cast<std::uint32_t>(external_weight - internal_weight);
           if (gain_u > best_gain_u) {
             best_gain_u = gain_u;
             best_gain = static_cast<int>(gain_u);
@@ -266,7 +265,8 @@ int find_balance_prefix_device(
     Kokkos::View<int*, typename ExecSpace::memory_space>& op_result) {
   Kokkos::deep_copy(delta, 0);
   Kokkos::deep_copy(balance_sequence, 0u);
-  Kokkos::deep_copy(op_result, -1);
+  // Mirror CUDA refinement behavior where d_op_result is memset to 0.
+  Kokkos::deep_copy(op_result, 0);
 
   const std::size_t prefix_limit = buffer_size;
   Kokkos::parallel_for(
@@ -366,6 +366,8 @@ std::size_t build_independent_move_buffer_device(
     unsigned long long partition_wgt_cap,
     const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& target_partition,
     const Kokkos::View<int*, typename ExecSpace::memory_space>& gain,
+    const Kokkos::View<unsigned*, typename ExecSpace::memory_space>& is_boundary,
+    Kokkos::View<unsigned*, typename ExecSpace::memory_space>& if_updated,
     Kokkos::View<MoveRequestDevice*, typename ExecSpace::memory_space>& buffer,
     Kokkos::View<unsigned long long*, typename ExecSpace::memory_space>& sort_keys,
     Kokkos::View<unsigned*, typename ExecSpace::memory_space>& sort_indices,
@@ -380,6 +382,11 @@ std::size_t build_independent_move_buffer_device(
       "build_independent_move_buffer_device",
       Kokkos::RangePolicy<ExecSpace>(0, static_cast<int>(num_vertices)),
       KOKKOS_LAMBDA(const int v) {
+        // Match CUDA create_independent_move_buffer: clear update flag for all vertices.
+        if_updated(v) = 0u;
+        if (is_boundary(v) == 0u) {
+          return;
+        }
         const unsigned vertex_partition = partition(v);
         const unsigned vertex_wgt = vwgt(v);
         const unsigned current_target = target_partition(v);
@@ -387,7 +394,7 @@ std::size_t build_independent_move_buffer_device(
         const bool within_cap = static_cast<unsigned long long>(partition_wgt(current_target)) +
                                     static_cast<unsigned long long>(vertex_wgt) <=
                                 partition_wgt_cap;
-        if (current_target == vertex_partition || current_gain <= 0 || !within_cap) {
+        if (current_gain <= 0 || !within_cap) {
           return;
         }
 
@@ -408,7 +415,7 @@ std::size_t build_independent_move_buffer_device(
           const bool neighbor_within_cap = static_cast<unsigned long long>(partition_wgt(neighbor_target)) +
                                                static_cast<unsigned long long>(neighbor_wgt) <=
                                            partition_wgt_cap;
-          if (neighbor_target == neighbor_partition || neighbor_gain <= 0 || !neighbor_within_cap) {
+          if (neighbor_gain <= 0 || !neighbor_within_cap) {
             continue;
           }
           if (neighbor_within_cap && (v + 1) > static_cast<int>(neighbor + 1u)) {
@@ -600,7 +607,7 @@ unsigned refine_partition_host(const HostCoarseGraph& graph,
   view_u d_is_boundary("refine_is_boundary", num_vertices);
   view_u d_movable("refine_movable", num_vertices);
   view_u d_if_updated("refine_if_updated", num_vertices);
-  view_i d_external_weights("refine_external_weights", num_vertices * partition_slots);
+  view_u d_external_weights("refine_external_weights", num_vertices * partition_slots);
   view_move d_buffer("refine_buffer", num_vertices);
   view_key d_sort_keys("refine_sort_keys", num_vertices);
   view_u d_sort_indices("refine_sort_indices", num_vertices);
@@ -659,10 +666,18 @@ unsigned refine_partition_host(const HostCoarseGraph& graph,
         partition_wgt_cap,
         d_target_partition,
         d_gain,
+        d_is_boundary,
+        d_if_updated,
         d_buffer,
         d_sort_keys,
         d_sort_indices,
         d_sorted_buffer);
+
+    if (num_vertices > 1000000u) {
+      std::cout << "[kokkos_refine_dbg] vertices=" << num_vertices
+                << ", iter=" << iteration
+                << ", buffer_size=" << buffer_size << "\n";
+    }
 
     if (buffer_size == 0u) {
       break;
@@ -679,6 +694,11 @@ unsigned refine_partition_host(const HostCoarseGraph& graph,
         d_delta,
         d_balance_sequence,
         d_op_result);
+    if (num_vertices > 1000000u) {
+      std::cout << "[kokkos_refine_dbg] vertices=" << num_vertices
+                << ", iter=" << iteration
+                << ", max_prefix=" << max_prefix << "\n";
+    }
     if (max_prefix < 0 || max_prefix >= static_cast<int>(buffer_limit)) {
       break;
     }
@@ -1114,6 +1134,10 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
   idx_t ncon = 1;
   idx_t mt_num_part = static_cast<idx_t>(partition_count);
   idx_t mt_cutsize = 0;
+  idx_t mt_options[METIS_NOPTIONS];
+  METIS_SetDefaultOptions(mt_options);
+  mt_options[METIS_OPTION_NUMBERING] = 0;
+  mt_options[METIS_OPTION_SEED] = 0;
 
   for (std::size_t i = 0; i < num_coarse_vertices; ++i) {
     mt_vwgt[i] = static_cast<idx_t>(h_coarse_vwgt(i));
@@ -1137,7 +1161,7 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
       &mt_num_part,
       nullptr,
       nullptr,
-      nullptr,
+      mt_options,
       &mt_cutsize,
       mt_partition.data());
 

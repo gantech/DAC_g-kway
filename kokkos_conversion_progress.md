@@ -277,3 +277,66 @@ Phase 5 complete.
 - Compare the exact coarse adjacency produced by the Kokkos contraction step against the CUDA baseline.
 - Tighten any remaining tie-breaking or edge aggregation differences in `kokkos_port/src/pipeline_stub.cpp`.
 - Remove temporary probes once the coarsening edge count matches CUDA or a final acceptable approximation is documented.
+
+## Latest Status Update (2026-06-17) — Refinement Parity Closure
+
+### Work Completed
+
+- Added [build_from_root.sh](build_from_root.sh): cwd-independent build script to eliminate path confusion.
+- Updated README.md with explicit root-safe build instructions.
+- Implemented deterministic METIS initialization with explicit seeding in both CUDA and Kokkos paths to remove initialization variability.
+- Added granular top-level refinement iteration tracing to both kernels for pass-level comparison.
+- Applied multiple refinement semantic alignment patches to Kokkos:
+  - Fixed `op_result` initialization to match CUDA memset behavior
+  - Removed extra neighbor boundary filters in move-buffer construction
+  - Removed explicit target-partition equality guards from move eligibility checks
+  - Aligned `if_updated` reset location to match CUDA kernel clearing point
+  - Switched candidate weight accumulation to unsigned arithmetic for overflow parity
+- Instrumented refinement with debug output showing iteration count, buffer size, and max prefix accepted.
+
+### Key Findings
+
+**Small case (delaunay_n11.graph, 8 partitions):**
+- Parity: exact match (diff = 0)
+- Status: stable and reproducible
+
+**Large case (mesh_graph.metis, 64 partitions):**
+- Current parity: ~2.8M vertices differ out of 2.9M total
+- CUDA self-determinism: CUDA vs CUDA on same input diffs by ~2.9M vertices even with fixed METIS seed
+  - This indicates the reference itself is nondeterministic at scale (likely due to atomic ordering in GPU warp operations)
+- Refinement iteration traces show structural divergence:
+  - CUDA: top-level refinement terminates at ~107–147 iterations depending on run
+  - Kokkos: top-level refinement terminates at ~94 iterations
+  - Early iterations accept vastly different prefix sizes (CUDA: typically 7–240, variable; Kokkos: frequently ~1000+)
+- Cutsize metrics:
+  - CUDA large: ranges 857k–882k depending on run (nondeterministic)
+  - Kokkos large: consistently 874k across runs
+- Both achieve valid partitions with acceptable weight balance
+
+### Architectural Insight
+
+Per-vertex exact label matching is not a reliable parity metric for large cases because:
+1. The CUDA reference itself exhibits run-to-run variation in final assignments despite identical input
+2. Atomic operation ordering on GPUs introduces inherent nondeterminism for concurrent moves
+3. Refinement pass trajectories naturally diverge when independent move sets differ slightly
+
+### Recommended Debugging Path
+
+Rather than chasing vertex-level divergence, measure **refinement semantics at the pass level**:
+1. Capture CUDA and Kokkos partition snapshots at each refinement iteration
+2. Compare per-iteration invariants: partition weights, boundary counts, cutsize deltas
+3. Identify which pass iteration the trajectories first diverge materially
+4. Isolate that divergence to a specific candidate ranking, balance test, or apply logic mismatch
+5. Once isolated, apply targeted Kokkos patch to re-synchronize that specific pass
+
+### Next Immediate Action
+
+Implement "same-start refinement debug mode" where both CUDA and Kokkos consume an identical pre-computed initial partition and refinement state, then run parallel refinement and log pass-level outcomes. This isolates refinement logic from initialization nondeterminism.
+
+### Files Modified
+
+- [build_from_root.sh](build_from_root.sh) — new root-safe build script
+- [README.md](README.md) — added root-safe build instructions
+- [gkway/metis_partition.hpp](gkway/metis_partition.hpp) — added explicit METIS options with fixed seed
+- [gkway/uncoarsen.hpp](gkway/uncoarsen.hpp) — added refinement iteration debug logging for large graphs
+- [kokkos_port/src/pipeline_stub.cpp](kokkos_port/src/pipeline_stub.cpp) — multiple semantic alignment patches + debug instrumentation

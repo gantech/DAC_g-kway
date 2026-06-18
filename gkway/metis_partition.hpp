@@ -31,6 +31,10 @@ void metis_init_partition(unsigned* d_vwgt, unsigned* d_adjp, unsigned* d_adjncy
   idx_t ncon = 1;
   idx_t mt_num_part = NUM_PARTITIONS;
   idx_t mt_cutsize;
+  idx_t mt_options[METIS_NOPTIONS];
+  METIS_SetDefaultOptions(mt_options);
+  mt_options[METIS_OPTION_NUMBERING] = 0;
+  mt_options[METIS_OPTION_SEED] = 0;
   //std::cout << "start copy vwgt and adjp \n";
   for(int i = 0; i < NUM_VERTICES; i++) {
     mt_vwgt[i] = (idx_t) h_vwgt[i];
@@ -44,7 +48,7 @@ void metis_init_partition(unsigned* d_vwgt, unsigned* d_adjp, unsigned* d_adjncy
     mt_adjwgt[i] = (idx_t) h_adjwgt[i];  
   }
   int res = METIS_PartGraphKway(&mt_num_vertex, &ncon, mt_adjp.data(), mt_adjncy.data(), mt_vwgt.data(), NULL, mt_adjwgt.data(), 
-                                &mt_num_part, NULL, NULL, NULL, &mt_cutsize, mt_partition.data());
+                                &mt_num_part, NULL, NULL, mt_options, &mt_cutsize, mt_partition.data());
 
   printf ( "\n" );
   printf ( "  Return code = %d\n", res );

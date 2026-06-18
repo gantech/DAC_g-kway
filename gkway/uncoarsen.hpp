@@ -455,14 +455,21 @@ namespace gk { // begin of namespace gk ========================================
     //std::cout << "@In refinement, NUM_VERTICES: " << NUM_VERTICES << ", NUM_EDGES: " << NUM_EDGES <<'\n';
     //std::cout << "************************************************\n";
     const unsigned NUM_BLOCKS = (NUM_VERTICES + THREAD_PER_BLOCK - 1) / THREAD_PER_BLOCK;
+    int debug_iteration = 0;
 
     while(true) {
+      ++debug_iteration;
       auto start = std::chrono::system_clock::now();
       check_cuda(cudaMemset(d_buffer_size, 0, sizeof(unsigned)));
       create_independent_move_buffer <<< NUM_BLOCKS, THREAD_PER_BLOCK, 0, stream1 >>> (d_partition, d_partition_wgt, d_vwgt, d_adjncy, 
                                                                                       d_adjp, d_if_boundary, d_vertex_gain, d_max_gain_partition, 
                                                                                       d_if_updated_vertex, d_mv_buffer, d_buffer_size, NUM_VERTICES);
       check_cuda(cudaMemcpy(hp_buffer_size, d_buffer_size, sizeof(unsigned), cudaMemcpyDeviceToHost));
+      if(NUM_VERTICES > 1000000) {
+        std::cout << "[cuda_refine_dbg] vertices=" << NUM_VERTICES
+                  << ", iter=" << debug_iteration
+                  << ", buffer_size=" << *hp_buffer_size << '\n';
+      }
       if(*hp_buffer_size == 0) {
         break;
       }
@@ -482,6 +489,11 @@ namespace gk { // begin of namespace gk ========================================
       find_balance_sequence <<< NUM_BLOCK_FOR_MOVE_BUFFER, THREAD_PER_BLOCK, 0, stream1 >>>(d_mv_buffer, d_mv_delta_partition_wgt, d_partition_wgt, 
                                                                                    d_mv_balance_sequence, d_op_result, *hp_buffer_size);
       cudaMemcpy(hp_op_result, d_op_result, sizeof(int), cudaMemcpyDeviceToHost);
+      if(NUM_VERTICES > 1000000) {
+        std::cout << "[cuda_refine_dbg] vertices=" << NUM_VERTICES
+                  << ", iter=" << debug_iteration
+                  << ", max_prefix=" << *hp_op_result << '\n';
+      }
       if(*hp_op_result == -1) { //no balance move
         std::cout << "!!! break: *h_find_if_pos:" << *hp_op_result  << '\n';
         break;

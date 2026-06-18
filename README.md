@@ -36,6 +36,16 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j
 ```
 
+From the repository root (cwd-safe, preferred):
+```bash
+./build_from_root.sh
+```
+
+Optional: control parallelism with `JOBS`:
+```bash
+JOBS=8 ./build_from_root.sh
+```
+
 This will produce the main executable /exec/g-kway
 
 ## Run
