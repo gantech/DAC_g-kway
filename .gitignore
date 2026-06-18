@@ -1,0 +1,14 @@
+build/
+build-kokkos/
+*.levels
+*.out
+*.levels.post_refine
+*.out.post_refine
+*.levels.pre_refine
+*.out.pre_refine
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
