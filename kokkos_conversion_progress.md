@@ -228,3 +228,52 @@ Phase 5 complete.
 
 - Keep working Phase 2-4 slices as needed for the broader port.
 - Preserve the CUDA path while iterating on the Kokkos capability.
+
+## Detailed Coarsening Debug Trail
+
+### What was verified first
+
+- The original Kokkos implementation was index-driven (`i / 2`) rather than graph-driven.
+- CUDA follows a multilevel coarsen/partition/uncoarsen flow, so the first task was to replace the synthetic lineage with graph-based coarsening.
+- The first Kokkos matcher bug was using `0u` as both a valid vertex index and an unmatched sentinel.
+- The second Kokkos matcher bug was ignoring `max_coarsen_group`; CUDA caps coarse groups at 6.
+
+### What was changed in the Kokkos pipeline
+
+- Replaced the synthetic one-shot index split with host-side graph coarsening in `kokkos_port/src/pipeline_stub.cpp`.
+- Added a multilevel coarsening loop and lineage projection so Kokkos no longer emits a fake single-step ancestry.
+- Kept the Kokkos side host-driven for now, but made it follow the CUDA driver structure more closely.
+- Added lineage-aware output writing for `.levels`, `.pre_refine.levels`, and `.post_refine.levels`.
+
+### What was compared against CUDA
+
+- Small graph used for fast validation: `simple_test/delaunay_n11.graph`.
+- CUDA baseline small-graph lineage started with `PartitionID,L1,L0`.
+- Kokkos output is now also `PartitionID,L1,L0` after the coarsening rewrite, which means the extra over-coarsening level was removed.
+- Current divergence remains in the actual coarse graph and final partitioning, not in the CSV shape.
+
+### Current observed mismatch
+
+- CUDA small-graph probe showed `num_coarsen_vertex=469` and `num_coarsen_edge=2826`.
+- Current Kokkos probe shows `coarsest_graph_vertices=469` and `coarsest_graph_edges=2848`.
+- Current Kokkos small-graph summary shows cutsize around `1381`, while the CUDA run reports `1307`.
+- The first lineage row still differs, for example CUDA has `46,26,1` where Kokkos currently has `29,27,1`.
+
+### What this suggests
+
+- The remaining gap is still in coarsening/contraction, not in the refinement pass or file formatting.
+- Vertex count now matches, so the remaining difference is in coarse graph connectivity and/or exact grouping order.
+- The current Kokkos path is much closer than the original stub, but it is still not a bitwise match to CUDA.
+
+### Host-side CUDA shaping work already applied
+
+- The Kokkos neighbor scorer was aligned with the CUDA weight/degree comparison strategy.
+- The coarse-graph builder was rewritten to use a row-wise sort-and-merge path instead of a global pair map.
+- Deterministic lineage numbering was restored so the coarse IDs are stable and follow the graph structure instead of hash iteration order.
+- The coarsening loop now mirrors the CUDA multilevel threshold behavior much more closely than the original one-level stub.
+
+### Remaining work
+
+- Compare the exact coarse adjacency produced by the Kokkos contraction step against the CUDA baseline.
+- Tighten any remaining tie-breaking or edge aggregation differences in `kokkos_port/src/pipeline_stub.cpp`.
+- Remove temporary probes once the coarsening edge count matches CUDA or a final acceptable approximation is documented.
