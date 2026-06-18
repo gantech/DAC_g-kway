@@ -559,7 +559,8 @@ unsigned refine_partition_host(const HostCoarseGraph& graph,
                                std::vector<unsigned>& partition,
                                int partition_count,
                                unsigned long long partition_wgt_cap,
-                               int max_iterations) {
+                               int max_iterations,
+                               bool verbose_refine = false) {
   unsigned total_moves = 0;
   int iteration = 0;
 
@@ -620,8 +621,16 @@ unsigned refine_partition_host(const HostCoarseGraph& graph,
   Kokkos::View<unsigned*, Kokkos::HostSpace> h_partition("h_partition", num_vertices);
   Kokkos::View<unsigned*, Kokkos::HostSpace> h_partition_wgt("h_partition_wgt", partition_slots);
 
-  Kokkos::deep_copy(d_cutsize, 0u);
   Kokkos::deep_copy(d_if_updated, 1u);
+
+  // Initialize d_cutsize to the real pre-refinement cutsize so per-pass
+  // debug prints track absolute cutsize values, matching the CUDA path.
+  const unsigned real_initial_cutsize = compute_cutsize_host(graph, partition, nullptr);
+  {
+    auto h_init_cut = Kokkos::create_mirror_view(d_cutsize);
+    h_init_cut(0) = real_initial_cutsize;
+    Kokkos::deep_copy(d_cutsize, h_init_cut);
+  }
 
   for (std::size_t i = 0; i < num_vertices; ++i) {
     h_partition(i) = partition[i];
@@ -673,7 +682,7 @@ unsigned refine_partition_host(const HostCoarseGraph& graph,
         d_sort_indices,
         d_sorted_buffer);
 
-    if (num_vertices > 1000000u) {
+    if (num_vertices > 1000000u || verbose_refine) {
       std::cout << "[kokkos_refine_dbg] vertices=" << num_vertices
                 << ", iter=" << iteration
                 << ", buffer_size=" << buffer_size << "\n";
@@ -694,7 +703,7 @@ unsigned refine_partition_host(const HostCoarseGraph& graph,
         d_delta,
         d_balance_sequence,
         d_op_result);
-    if (num_vertices > 1000000u) {
+    if (num_vertices > 1000000u || verbose_refine) {
       std::cout << "[kokkos_refine_dbg] vertices=" << num_vertices
                 << ", iter=" << iteration
                 << ", max_prefix=" << max_prefix << "\n";
@@ -716,6 +725,13 @@ unsigned refine_partition_host(const HostCoarseGraph& graph,
         d_cutsize);
 
     total_moves += static_cast<unsigned>(max_prefix + 1);
+    if (num_vertices > 1000000u || verbose_refine) {
+      const auto h_cur_cut = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d_cutsize);
+      std::cout << "[kokkos_refine_dbg] vertices=" << num_vertices
+                << ", iter=" << iteration
+                << ", moves=" << (max_prefix + 1)
+                << ", cutsize=" << h_cur_cut(0) << "\n";
+    }
   }
 
   Kokkos::deep_copy(h_partition, d_partition);
@@ -1107,6 +1123,62 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
           ? static_cast<unsigned long long>(config.max_partition_wgt)
         : static_cast<unsigned long long>(
           (static_cast<double>(total_coarse_wgt) / static_cast<double>(partition_count)) * 1.03 + 1.0);
+
+  // -------------------------------------------------------------------------
+  // Same-start refinement debug mode:
+  // Load a pre-computed initial partition for the L0 graph (e.g. produced by
+  // the CUDA path via OUT_FILE.same_start.txt), skip coarsening + METIS, and
+  // run refinement on the original graph with verbose per-pass logging so both
+  // pathways can be compared side-by-side.
+  // -------------------------------------------------------------------------
+  if (!options.same_start_file.empty()) {
+    std::vector<unsigned> injected_partition;
+    {
+      std::ifstream infile(options.same_start_file);
+      if (!infile) {
+        std::cerr << "[same_start] cannot open partition file: "
+                  << options.same_start_file << '\n';
+        return;
+      }
+      unsigned p;
+      while (infile >> p) {
+        injected_partition.push_back(p);
+      }
+    }
+    if (injected_partition.size() != num_vertices) {
+      std::cerr << "[same_start] partition file has " << injected_partition.size()
+                << " entries but graph has " << num_vertices << " vertices\n";
+      return;
+    }
+    std::cout << "[same_start] loaded partition from " << options.same_start_file
+              << " (" << injected_partition.size() << " vertices)\n";
+
+    const HostCoarseGraph& l0_graph = level_graphs.front();
+    const unsigned pre_cutsize =
+        compute_cutsize_host(l0_graph, injected_partition, nullptr);
+    std::cout << "[same_start] pre-refinement cutsize=" << pre_cutsize
+              << ", partition_wgt_cap=" << partition_wgt_cap << "\n";
+
+    refine_partition_host(l0_graph, injected_partition, partition_count,
+                          partition_wgt_cap, /*max_iterations=*/0,
+                          /*verbose_refine=*/true);
+
+    const unsigned post_cutsize =
+        compute_cutsize_host(l0_graph, injected_partition, nullptr);
+    std::cout << "[same_start] post-refinement cutsize=" << post_cutsize << "\n";
+
+    // Write simple per-vertex output for inspection.
+    {
+      std::ofstream out_levels(options.out_prefix + ".same_start.levels");
+      out_levels << "PartitionID,L0\n";
+      for (std::size_t i = 0; i < injected_partition.size(); ++i) {
+        out_levels << injected_partition[i] << ',' << (i + 1u) << '\n';
+      }
+    }
+    std::cout << "[same_start] wrote " << options.out_prefix
+              << ".same_start.levels\n";
+    return;
+  }
 
   view_u coarse_adjp("coarse_adjp", coarse_graph.adjp.size());
   view_u coarse_adjncy("coarse_adjncy", coarse_graph.adjncy.size());

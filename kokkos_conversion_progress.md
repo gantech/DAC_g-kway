@@ -331,12 +331,65 @@ Rather than chasing vertex-level divergence, measure **refinement semantics at t
 
 ### Next Immediate Action
 
-Implement "same-start refinement debug mode" where both CUDA and Kokkos consume an identical pre-computed initial partition and refinement state, then run parallel refinement and log pass-level outcomes. This isolates refinement logic from initialization nondeterminism.
+~~Implement "same-start refinement debug mode"~~ — **Done (2026-06-17)**
+
+### Same-Start Refinement Debug Mode (Implemented)
+
+Both CUDA and Kokkos now support a same-start mode that isolates refinement
+logic from initialization/coarsening nondeterminism.
+
+**CUDA side** (`gkway/graph_partitioner.hpp`, `gkway/uncoarsen.hpp`):
+- `uncoarsening()` now accepts an optional `out_finest_pre_refine` pointer.
+  Before each `gk::refinement()` call, `d_cutsize` is reset to the actual
+  cutsize of the current level (so per-iteration prints track absolute values).
+  On the last (finest) level, the pre-refinement L0 partition is captured and
+  written to `<OUT_FILE>.same_start.txt` (one partition ID per line).
+- `gk::refinement()` now prints `cutsize` after each apply step alongside the
+  existing `buffer_size` and `max_prefix` lines.
+
+**Kokkos side** (`kokkos_port/src/pipeline_stub.cpp`, `kokkos_port/src/main.cpp`,
+`kokkos_port/include/gkway_kokkos/pipeline.hpp`):
+- `RunOptions` gained `same_start_file`; the CLI now accepts a 6th positional
+  argument:
+  ```
+  ./build/exec/gkway-kokkos graph num_parts out_prefix [refinement_passes] [same_start_partition_file]
+  ```
+- When `same_start_file` is set, the pipeline skips coarsening + METIS, loads
+  the injected partition, and calls `refine_partition_host()` with
+  `verbose_refine=true` on the L0 graph.
+- `refine_partition_host()` now initialises `d_cutsize` from the real
+  pre-refinement cutsize (via `compute_cutsize_host`) so per-pass cutsize
+  values are absolute. It gains a `verbose_refine` flag that forces per-pass
+  logging even on small graphs, and a new post-apply line:
+  ```
+  [kokkos_refine_dbg] vertices=…, iter=…, moves=…, cutsize=…
+  ```
+- Output is written to `<out_prefix>.same_start.levels` (`PartitionID,L0`).
+
+**Workflow to compare:**
+```bash
+# 1. Run CUDA to produce the same-start partition file
+./build/exec/g-kway mesh_graph.metis 64 out_cuda_dbg
+
+# 2. Run Kokkos in same-start mode using CUDA's pre-refinement L0 partition
+./build/exec/gkway-kokkos mesh_graph.metis 64 out_kokkos_dbg 1 out_cuda_dbg.same_start.txt
+
+# 3. Compare per-pass logs
+grep cuda_refine_dbg  <cuda-stdout>   | head -50
+grep kokkos_refine_dbg <kokkos-stdout> | head -50
+```
+Both programs will print matching `vertices=`, `iter=`, `buffer_size=`,
+`max_prefix=`, `cutsize=` lines. Side-by-side comparison immediately shows
+which iteration and which metric first diverges, isolating the refinement
+logic difference from any coarsening/METIS nondeterminism.
 
 ### Files Modified
 
 - [build_from_root.sh](build_from_root.sh) — new root-safe build script
 - [README.md](README.md) — added root-safe build instructions
 - [gkway/metis_partition.hpp](gkway/metis_partition.hpp) — added explicit METIS options with fixed seed
-- [gkway/uncoarsen.hpp](gkway/uncoarsen.hpp) — added refinement iteration debug logging for large graphs
-- [kokkos_port/src/pipeline_stub.cpp](kokkos_port/src/pipeline_stub.cpp) — multiple semantic alignment patches + debug instrumentation
+- [gkway/uncoarsen.hpp](gkway/uncoarsen.hpp) — added refinement iteration debug logging for large graphs; added per-pass `cutsize` print after apply
+- [gkway/graph_partitioner.hpp](gkway/graph_partitioner.hpp) — `uncoarsening()` now resets `d_cutsize` per level and captures finest-level pre-refine partition; `graph_partitioner()` writes `<out>.same_start.txt`
+- [kokkos_port/src/pipeline_stub.cpp](kokkos_port/src/pipeline_stub.cpp) — `refine_partition_host()` initialises cutsize properly and adds `verbose_refine` + post-apply log; `run_pipeline_stub()` implements same-start mode
+- [kokkos_port/include/gkway_kokkos/pipeline.hpp](kokkos_port/include/gkway_kokkos/pipeline.hpp) — added `same_start_file` to `RunOptions`
+- [kokkos_port/src/main.cpp](kokkos_port/src/main.cpp) — accepts optional 6th `same_start_partition_file` argument

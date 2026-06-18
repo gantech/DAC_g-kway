@@ -136,7 +136,8 @@ void uncoarsening(std::vector<unsigned>& coarsen_num_vertices_vec, std::vector<u
                   unsigned* d_adjncy, unsigned* d_adjwgt, unsigned* d_adjp, unsigned* d_cmap, unsigned* d_partition_wgt, 
                   unsigned* d_cutsize, unsigned* d_vwgt, const int NUM_PARTITIONS, const unsigned MAX_NUM_VERTICES, 
                   const unsigned MAX_NUM_EDGES, cudaStream_t stream1, mgpu::context_t& context,
-                  std::vector<std::vector<unsigned>>& partition_snapshots) {
+                  std::vector<std::vector<unsigned>>& partition_snapshots,
+                  std::vector<unsigned>* out_finest_pre_refine = nullptr) {
    
    unsigned* d_if_updated_vertex;
    unsigned* d_max_gain_partition;
@@ -193,6 +194,24 @@ void uncoarsening(std::vector<unsigned>& coarsen_num_vertices_vec, std::vector<u
     gk::uncoarsen(d_partition, d_tmp_if_boundary, d_if_boundary, d_vertex_gain, d_max_gain_partition, d_adjncy+global_edge_offset, 
                   d_adjwgt+global_edge_offset, d_adjp+global_ptr_offset, d_cmap+global_vertex_offset, d_tmp_partition, 
                   d_if_updated_vertex, d_partition_wgt, num_finer_vertex, num_finer_edge, num_coarsen_vertex, num_coarsen_edge, stream1);
+
+    // Reset d_cutsize to the actual cutsize at this refinement level so per-pass
+    // debug prints reflect absolute cutsize values rather than accumulated deltas.
+    {
+      check_cuda(cudaMemset(d_cutsize, 0, sizeof(unsigned)));
+      const unsigned numblk = (num_finer_vertex + THREAD_PER_BLOCK - 1) / THREAD_PER_BLOCK;
+      gk::calculate_cutsize <<< numblk, THREAD_PER_BLOCK, 0, stream1 >>> (
+          d_partition, d_adjncy+global_edge_offset, d_adjwgt+global_edge_offset,
+          d_adjp+global_ptr_offset, d_cutsize, num_finer_vertex);
+      check_cuda(cudaStreamSynchronize(stream1));
+    }
+    // Capture the pre-refinement partition at the finest level for same-start debug.
+    if (out_finest_pre_refine != nullptr && i == coarsen_it - 2) {
+      out_finest_pre_refine->resize(num_finer_vertex);
+      check_cuda(cudaMemcpy(out_finest_pre_refine->data(), d_partition,
+                            sizeof(unsigned) * num_finer_vertex,
+                            cudaMemcpyDeviceToHost));
+    }
 
     gk::refinement(d_adjp+global_ptr_offset, d_vwgt+global_vertex_offset, d_partition, d_partition_wgt, d_adjncy+global_edge_offset, 
                    d_adjwgt+global_edge_offset, d_buffer_size, hp_buffer_size, d_pos, d_op_result, hp_pos, hp_op_result, 
@@ -451,12 +470,14 @@ void graph_partitioner(const std::string& GRAPH_FILE, const std::string& OUT_FIL
   auto init_end = std::chrono::system_clock::now();
 
   std::vector<std::vector<unsigned>> partition_snapshots;
+  std::vector<unsigned> finest_pre_refine;
 
   cudaStreamSynchronize(stream1);
   auto refine_start = std::chrono::system_clock::now();
   uncoarsening(coarsen_num_vertices_vec, coarsen_num_edges_vec, global_vertex_offset_vec, global_ptr_offset_vec, global_edge_offset_vec,
                 d_partition, d_if_boundary, d_adjncy, d_adjwgt, d_adjp, d_cmap, d_partition_wgt, d_cutsize,
-                d_vwgt, NUM_PARTITIONS, MAX_NUM_VERTICES, MAX_NUM_EDGES, stream1, context, partition_snapshots);
+                d_vwgt, NUM_PARTITIONS, MAX_NUM_VERTICES, MAX_NUM_EDGES, stream1, context, partition_snapshots,
+                &finest_pre_refine);
 
   auto refine_end = std::chrono::system_clock::now();
   auto end = std::chrono::system_clock::now();
@@ -479,6 +500,17 @@ void graph_partitioner(const std::string& GRAPH_FILE, const std::string& OUT_FIL
   check_cuda(cudaMemcpy(vertex_partition.data(), d_partition, sizeof(int) * MAX_NUM_VERTICES, cudaMemcpyDeviceToHost));
   graph_parser.dump_result(vertex_partition, OUT_FILE);
   dump_multilevel_lineage(OUT_FILE, coarsen_num_vertices_vec, d_cmap, d_partition);
+
+  // Write same-start partition file for Kokkos cross-comparison.
+  if (!finest_pre_refine.empty()) {
+    std::ofstream ss_out(OUT_FILE + ".same_start.txt");
+    for (const unsigned p : finest_pre_refine) {
+      ss_out << p << '\n';
+    }
+    std::cout << "[same_start] wrote pre-refinement L0 partition ("
+              << finest_pre_refine.size() << " vertices) to "
+              << OUT_FILE << ".same_start.txt\n";
+  }
 
   cudaFree(d_partition);
   cudaFree(d_partition_wgt);

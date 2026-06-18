@@ -504,6 +504,11 @@ namespace gk { // begin of namespace gk ========================================
 
       unsigned h_cutsize;
       check_cuda(cudaMemcpy(&h_cutsize, d_cutsize, sizeof(unsigned), cudaMemcpyDeviceToHost));
+      if(NUM_VERTICES > 1000000) {
+        std::cout << "[cuda_refine_dbg] vertices=" << NUM_VERTICES
+                  << ", iter=" << debug_iteration
+                  << ", cutsize=" << h_cutsize << '\n';
+      }
       const unsigned MAX_VERTEX_PER_BLOCK = 128;
       const unsigned VERTEX_GROUP_BLOCK = (NUM_VERTICES + MAX_VERTEX_PER_BLOCK - 1) / MAX_VERTEX_PER_BLOCK;
       update_vertex_info <<< VERTEX_GROUP_BLOCK, MAX_VERTEX_PER_BLOCK, 0, stream1 >>> (d_partition, d_if_boundary, d_vertex_gain, d_max_gain_partition, 

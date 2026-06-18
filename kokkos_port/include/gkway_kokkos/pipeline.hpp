@@ -11,6 +11,9 @@ struct RunOptions {
   int num_partitions = 0;
   std::string out_prefix;
   int refinement_passes = 1;
+  // When non-empty: skip coarsening + METIS, load this pre-computed partition
+  // for the L0 graph, and run same-start refinement debug mode.
+  std::string same_start_file;
 };
 
 template <typename ExecSpace>
