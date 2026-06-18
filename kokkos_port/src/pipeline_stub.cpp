@@ -116,6 +116,7 @@ std::vector<CandidateHost> build_refinement_candidates_host(const HostCoarseGrap
       }
     }
 
+    std::uint32_t best_gain_u = 0u;
     int best_gain = 0;
     unsigned best_target = vertex_partition;
     for (int p = 0; p < partition_count; ++p) {
@@ -129,8 +130,11 @@ std::vector<CandidateHost> build_refinement_candidates_host(const HostCoarseGrap
         continue;
       }
 
-      const int gain = it->second - internal_weight;
-      if (gain > best_gain) {
+      const std::uint32_t gain_u =
+          static_cast<std::uint32_t>(it->second) - static_cast<std::uint32_t>(internal_weight);
+      const int gain = static_cast<int>(gain_u);
+      if (gain_u > best_gain_u) {
+        best_gain_u = gain_u;
         best_gain = gain;
         best_target = candidate_partition;
       }
@@ -221,7 +225,8 @@ int find_max_balance_prefix_host(const std::vector<MoveRequestHost>& buffer,
   }
 
   std::vector<std::int64_t> delta(static_cast<std::size_t>(partition_count), 0);
-  int best = -1;
+  // Mirror CUDA behavior where op_result is memset to 0 before searching.
+  int best = 0;
   for (std::size_t i = 0; i < buffer.size(); ++i) {
     const MoveRequestHost& mv = buffer[i];
     const unsigned vertex_wgt = vwgt[mv.vertex_id - 1u];
@@ -230,9 +235,14 @@ int find_max_balance_prefix_host(const std::vector<MoveRequestHost>& buffer,
 
     bool balance_ok = true;
     for (int p = 0; p < partition_count; ++p) {
-      const std::uint64_t new_wgt = static_cast<std::uint64_t>(
-          static_cast<std::int64_t>(partition_wgt[static_cast<std::size_t>(p)]) + delta[static_cast<std::size_t>(p)]);
-      if (new_wgt > partition_wgt_cap) {
+      const std::int64_t d = delta[static_cast<std::size_t>(p)];
+      if (d <= 0) {
+        continue;
+      }
+
+      const std::int64_t new_wgt =
+          static_cast<std::int64_t>(partition_wgt[static_cast<std::size_t>(p)]) + d;
+      if (new_wgt > static_cast<std::int64_t>(partition_wgt_cap)) {
         balance_ok = false;
         break;
       }
@@ -271,9 +281,13 @@ unsigned refine_partition_host(const HostCoarseGraph& graph,
       break;
     }
 
+    if (buffer.size() > 1024u) {
+      buffer.resize(1024u);
+    }
+
     const int max_prefix =
         find_max_balance_prefix_host(buffer, graph.vwgt, partition_wgt, partition_wgt_cap, partition_count);
-    if (max_prefix < 0) {
+    if (max_prefix < 0 || max_prefix >= static_cast<int>(buffer.size())) {
       break;
     }
 
@@ -663,9 +677,6 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
     total_coarse_wgt = 1;
   }
 
-    const unsigned long long ideal_partition_wgt =
-      (total_coarse_wgt + static_cast<unsigned long long>(partition_count) - 1ull) /
-      static_cast<unsigned long long>(partition_count);
   const unsigned long long partition_wgt_cap =
       (config.max_partition_wgt > 0.0f)
           ? static_cast<unsigned long long>(config.max_partition_wgt)
@@ -762,7 +773,7 @@ void run_pipeline_stub(const RunOptions& options, const PartitionConfig& config)
 
     const HostCoarseGraph& finer_graph = level_graphs[level - 1u];
     const unsigned moves_this_level =
-        refine_partition_host(finer_graph, finer_partition, partition_count, partition_wgt_cap, refinement_pass_limit);
+      refine_partition_host(finer_graph, finer_partition, partition_count, partition_wgt_cap, 0);
     proposed_moves += static_cast<unsigned long long>(moves_this_level);
     last_pass_moves_per_level.push_back(moves_this_level);
     if (moves_this_level > 0) {
